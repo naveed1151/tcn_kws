@@ -1,4 +1,4 @@
-# tcn_kws_scratch
+# tcn_kws
 mchines can hear us
 tcn_kws_scratch/
 ├── README.md               # Project overview and instructions
