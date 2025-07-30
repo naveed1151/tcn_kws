@@ -1,6 +1,7 @@
 # --- Top of the file (same imports) ---
 import os
 import torch
+import time
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split, Dataset
@@ -220,6 +221,15 @@ class Trainer:
 # --- Main ---
 if __name__ == "__main__":
     trainer = Trainer(data_dir=DATA_DIR, target_word=TARGET_WORD)
+
+    start = time.perf_counter()            # <-- start timer
     trainer.train()
+    elapsed = time.perf_counter() - start  # <-- end timer
+
+    # Nicely formatted duration
+    mins, secs = divmod(int(elapsed), 60)
+    hrs, mins = divmod(mins, 60)
+    print(f"Total training time: {hrs:02d}:{mins:02d}:{secs:02d} (hh:mm:ss)")
+
     trainer.save()
     trainer.plot_metrics()
