@@ -1,267 +1,225 @@
+# --- Top of the file (same imports) ---
 import os
-import numpy as np
-import random
-import matplotlib.pyplot as plt
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split, Dataset
 from model.model import DilatedTCN
+from data_loader.mfcc_dataset import MFCCDataset
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
-# ------------- Config -------------
+# --- Config Globals ---
+DATA_DIR = "data/preprocessed"
+TARGET_WORD = "bird"
+BATCH_SIZE = 32
+NUM_EPOCHS = 20
+LEARNING_RATE = 1e-5
+VAL_SPLIT = 0.2
+POS_WEIGHT = None       # e.g. 30.0 or None
+THRESHOLD = 0.5         # e.g. 0.2 or None to default to 0.5
+WEIGHT_DECAY = 0.0      # e.g. 1e-5 or 0.0 to disable
+DROPOUT = 0.0           # e.g. 0.3 or 0.0 to disable
+NEG_DOWNSAMPLE_RATIO = None  # e.g. 2.0 keeps 1 pos : 2 neg, or None to disable
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-DATA_DIR = "data/preprocessed"      # Folder with preprocessed MFCC .npy files
-TARGET_WORD = "bird"                 # Target word for binary classification
-MFCC_SHAPE = (49, 16)                # Shape of saved MFCC features (time frames, MFCC coeffs)
-IN_CHANNELS = 16                    # Number of MFCC features (input channels)
-HIDDEN_CHANNELS = 32                # Hidden channels in TCN layers
-EMBEDDING_DIM = 64                  # Final embedding dimension (output of TCN)
-NUM_LAYERS = 5                     # Number of TCN layers (dilations double each layer)
-LEARNING_RATE = 1e-3                # Learning rate for SGD
-EPOCHS = 30                        # Number of training epochs
-BATCH_SIZE = 16                    # Mini-batch size for training loop
-TRAIN_TEST_SPLIT = 0.8             # Train/validation split ratio
-SEED = 42                         # Random seed for reproducibility
+# --- Data Wrapping and Filtering ---
+class BinaryKeywordDataset(Dataset):
+    def __init__(self, base_dataset, target_word, index_to_word, downsample_ratio=None):
+        self.target_word = target_word
+        self.index_to_word = index_to_word
+        samples = []
+        for x, label in base_dataset:
+            word = index_to_word[label]
+            binary_label = 1 if word == target_word else 0
+            samples.append((x, binary_label))
 
-random.seed(SEED)
-np.random.seed(SEED)
+        if downsample_ratio is not None:
+            positives = [s for s in samples if s[1] == 1]
+            negatives = [s for s in samples if s[1] == 0]
+            keep_neg = int(len(positives) * downsample_ratio)
+            negatives = negatives[:keep_neg]
+            samples = positives + negatives
+        self.samples = samples
 
+    def __len__(self):
+        return len(self.samples)
 
-# ------------- Utility Functions -------------
-
-def load_data(data_dir):
-    """
-    Loads all .npy MFCC files from the data directory.
-    Labels samples as 1 if filename starts with TARGET_WORD, else 0.
-
-    Returns:
-        X: numpy array of shape (N_samples, T, F)
-        y: numpy array of binary labels (N_samples,)
-    """
-    X, y = [], []
-    for fname in os.listdir(data_dir):
-        if fname.endswith(".npy"):
-            label = 1 if fname.startswith(TARGET_WORD) else 0
-            mfcc = np.load(os.path.join(data_dir, fname))
-            if mfcc.shape == MFCC_SHAPE:  # Ensure consistent shape
-                X.append(mfcc)
-                y.append(label)
-    X = np.array(X)
-    y = np.array(y)
-    return X, y
-
-
-def sigmoid(x):
-    """Numerically stable sigmoid function."""
-    return 1 / (1 + np.exp(-x))
+    def __getitem__(self, idx):
+        return self.samples[idx]
 
 
-def binary_cross_entropy(preds, targets):
-    """
-    Computes binary cross-entropy loss.
-
-    Args:
-        preds: predicted probabilities (batch_size,)
-        targets: true binary labels (batch_size,)
-
-    Returns:
-        Average loss over batch
-    """
-    eps = 1e-8  # to avoid log(0)
-    preds = np.clip(preds, eps, 1 - eps)
-    loss = -np.mean(targets * np.log(preds) + (1 - targets) * np.log(1 - preds))
-    return loss
-
-
-def shuffle_data(X, y):
-    """Shuffle data and labels in unison."""
-    perm = np.random.permutation(len(X))
-    return X[perm], y[perm]
-
-
-# ------------- Training Class -------------
-
+# --- Trainer Class ---
 class Trainer:
-    def __init__(self):
-        """
-        Initialize the Dilated TCN model and final classification layer.
-        """
-        # Instantiate TCN model with given hyperparameters
-        self.model = DilatedTCN(IN_CHANNELS, HIDDEN_CHANNELS, EMBEDDING_DIM,
-                                num_layers=NUM_LAYERS)
+    def __init__(self, data_dir, target_word=TARGET_WORD, batch_size=BATCH_SIZE,
+                 epochs=NUM_EPOCHS, lr=LEARNING_RATE, val_split=VAL_SPLIT, device=DEVICE):
+        self.device = device
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.lr = lr
+        self.val_split = val_split
+        self.data_dir = data_dir
+        self.target_word = target_word
 
-        # Final linear layer weights and bias for binary classification (embedding_dim → 1)
-        self.fc_w = np.random.randn(EMBEDDING_DIM, 1) * np.sqrt(2 / EMBEDDING_DIM)
-        self.fc_b = np.zeros(1)
+        full_dataset = MFCCDataset(self.data_dir)
+        self.index_to_word = {v: k for k, v in full_dataset.label_to_index.items()}
+        binary_dataset = BinaryKeywordDataset(full_dataset, target_word, self.index_to_word, downsample_ratio=NEG_DOWNSAMPLE_RATIO)
 
-    def forward(self, x):
-        """
-        Forward pass for one sample.
+        val_size = int(len(binary_dataset) * self.val_split)
+        train_size = len(binary_dataset) - val_size
+        self.train_dataset, self.val_dataset = random_split(binary_dataset, [train_size, val_size])
 
-        Args:
-            x: MFCC input array (T, in_channels)
+        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
+        self.val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size)
 
-        Returns:
-            prob: predicted probability (scalar)
-            emb: embedding vector from TCN (embedding_dim,)
-            logits: raw output logit (scalar)
-        """
-        emb = self.model(x)                         # Get embedding from TCN
-        logits = emb @ self.fc_w + self.fc_b       # Linear layer (embedding → logit)
-        prob = sigmoid(logits)[0]                   # Sigmoid to get probability
-        return prob, emb, logits
+        sample_x, _ = self.train_dataset[0]
+        input_channels = sample_x.shape[0]
+        seq_len = sample_x.shape[1]
+        self.num_layers = self._calc_layers(seq_len)
 
-    def backward(self, x, emb, logits, prob, target):
-        """
-        Backward pass and parameter update for one sample.
+        self.model = DilatedTCN(
+            input_channels=input_channels,
+            num_layers=self.num_layers,
+            hidden_channels=64,
+            kernel_size=3,
+            num_classes=1,
+            dropout=DROPOUT
+        ).to(self.device)
 
-        Note:
-            Currently only updates final linear layer weights.
-            Full backprop through TCN is more complex and not implemented here.
+        if POS_WEIGHT is not None:
+            pos_weight_tensor = torch.tensor([POS_WEIGHT], device=self.device)
+            self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+        else:
+            self.criterion = nn.BCEWithLogitsLoss()
 
-        Args:
-            x: input sample (not used in this simplified update)
-            emb: embedding from TCN
-            logits: output logit
-            prob: predicted probability
-            target: true label (0 or 1)
-        """
-        # Gradient of BCE loss wrt logit
-        dL_dlogit = prob - target  # scalar
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=WEIGHT_DECAY)
 
-        # Gradients for final linear layer weights and bias
-        dL_dfc_w = np.outer(emb, dL_dlogit)  # shape (embedding_dim, 1)
-        dL_dfc_b = dL_dlogit                 # scalar
+        self.train_losses = []
+        self.val_losses = []
+        self.val_accuracies = []
+        self.val_precisions = []
+        self.val_recalls = []
+        self.val_f1s = []
 
-        # Update final layer weights with SGD
-        self.fc_w -= LEARNING_RATE * dL_dfc_w
-        self.fc_b -= LEARNING_RATE * dL_dfc_b
+    def _calc_layers(self, seq_len, kernel_size=3, dilation_base=2):
+        L = 0
+        receptive_field = 1
+        while receptive_field < seq_len:
+            receptive_field += (kernel_size - 1) * (dilation_base ** L)
+            L += 1
+        return L
 
-    def train(self, X_train, y_train, X_val, y_val):
-        """
-        Train the model for specified epochs on the training set.
+    def train_epoch(self):
+        self.model.train()
+        total_loss = 0
+        loop = tqdm(self.train_loader, desc="Training", leave=False)
+        for batch_x, batch_y in loop:
+            batch_x = batch_x.to(self.device)
+            batch_y = batch_y.float().unsqueeze(1).to(self.device)
 
-        Args:
-            X_train: training inputs (N_train, T, F)
-            y_train: training labels (N_train,)
-            X_val: validation inputs
-            y_val: validation labels
-        """
-        for epoch in range(1, EPOCHS + 1):
-            X_train, y_train = shuffle_data(X_train, y_train)
-            losses = []
+            self.optimizer.zero_grad()
+            logits = self.model(batch_x)
+            loss = self.criterion(logits, batch_y)
+            loss.backward()
+            self.optimizer.step()
 
-            # Mini-batch training loop
-            for i in range(0, len(X_train), BATCH_SIZE):
-                batch_x = X_train[i:i + BATCH_SIZE]
-                batch_y = y_train[i:i + BATCH_SIZE]
+            total_loss += loss.item()
+            loop.set_postfix(loss=loss.item())
 
-                batch_loss = 0
-                for x, target in zip(batch_x, batch_y):
-                    prob, emb, logits = self.forward(x)
-                    loss = binary_cross_entropy(np.array([prob]), np.array([target]))
-                    batch_loss += loss
-                    self.backward(x, emb, logits, prob, target)
+        avg_loss = total_loss / len(self.train_loader)
+        self.train_losses.append(avg_loss)
+        return avg_loss
 
-                losses.append(batch_loss / len(batch_x))
-
-            avg_loss = np.mean(losses)
-            val_acc = self.evaluate(X_val, y_val)
-
-            print(f"Epoch {epoch:02d} - Loss: {avg_loss:.4f} - Val Acc: {val_acc:.4f}")
-
-    def evaluate(self, X, y):
-        """
-        Evaluate model accuracy on given dataset.
-
-        Args:
-            X: input samples
-            y: true labels
-
-        Returns:
-            Accuracy (0-1)
-        """
+    def validate(self):
+        self.model.eval()
+        total_loss = 0
         correct = 0
-        for x, target in zip(X, y):
-            prob, _, _ = self.forward(x)
-            pred = 1 if prob >= 0.5 else 0
-            if pred == target:
-                correct += 1
-        return correct / len(y)
+        total = 0
+        tp = 0
+        fp = 0
+        fn = 0
 
-    def save_weights(self, folder_path="weights"):
-        """
-        Save trained weights to .npy files.
+        loop = tqdm(self.val_loader, desc="Validating", leave=False)
+        with torch.no_grad():
+            for batch_x, batch_y in loop:
+                batch_x = batch_x.to(self.device)
+                batch_y = batch_y.float().unsqueeze(1).to(self.device)
 
-        Args:
-            folder_path: directory where weights will be saved
-        """
-        os.makedirs(folder_path, exist_ok=True)
+                logits = self.model(batch_x)
+                loss = self.criterion(logits, batch_y)
+                total_loss += loss.item()
 
-        # Save TCN weights and biases layer-wise
-        for i, ((w, _), b) in enumerate(zip(self.model.weights, self.model.biases)):
-            np.save(os.path.join(folder_path, f"layer_{i}_weights.npy"), w)
-            np.save(os.path.join(folder_path, f"layer_{i}_biases.npy"), b)
+                threshold = THRESHOLD if THRESHOLD is not None else 0.5
+                preds = (torch.sigmoid(logits) > threshold).float()
 
-        # Save final fully connected layer weights and bias
-        np.save(os.path.join(folder_path, "fc_weights.npy"), self.fc_w)
-        np.save(os.path.join(folder_path, "fc_bias.npy"), self.fc_b)
+                correct += (preds == batch_y).sum().item()
+                total += batch_y.size(0)
+                tp += ((preds == 1) & (batch_y == 1)).sum().item()
+                fp += ((preds == 1) & (batch_y == 0)).sum().item()
+                fn += ((preds == 0) & (batch_y == 1)).sum().item()
 
-        print(f"Saved weights to folder '{folder_path}'")
+        avg_loss = total_loss / len(self.val_loader)
+        accuracy = correct / total if total > 0 else 0
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+        self.val_losses.append(avg_loss)
+        self.val_accuracies.append(accuracy)
+        self.val_precisions.append(precision)
+        self.val_recalls.append(recall)
+        self.val_f1s.append(f1)
+
+        return accuracy
+
+    def train(self):
+        for epoch in range(1, self.epochs + 1):
+            print(f"Epoch {epoch}/{self.epochs}:")
+            train_loss = self.train_epoch()
+            val_acc = self.validate()
+            print(f"  Loss: {train_loss:.4f} - Val Acc: {val_acc:.4f}")
+
+    def save(self, path="model_weights.pt"):
+        torch.save(self.model.state_dict(), path)
+        print(f"Model saved to {path}")
+
+    def plot_metrics(self, out_dir="plots"):
+        os.makedirs(out_dir, exist_ok=True)
+
+        fig, axs = plt.subplots(3, 1, figsize=(12, 12))
+        fig.tight_layout(pad=5.0)
+
+        axs[0].plot(self.train_losses, label="Train Loss")
+        axs[0].plot(self.val_losses, label="Validation Loss")
+        axs[0].set_title("Loss Over Epochs")
+        axs[0].set_xlabel("Epoch")
+        axs[0].set_ylabel("Loss")
+        axs[0].legend()
+        axs[0].grid(True)
+
+        axs[1].plot(self.val_accuracies, label="Validation Accuracy")
+        axs[1].set_title("Validation Accuracy Over Epochs")
+        axs[1].set_xlabel("Epoch")
+        axs[1].set_ylabel("Accuracy")
+        axs[1].legend()
+        axs[1].grid(True)
+
+        axs[2].plot(self.val_precisions, label="Precision")
+        axs[2].plot(self.val_recalls, label="Recall")
+        axs[2].plot(self.val_f1s, label="F1 Score")
+        axs[2].set_title("Precision, Recall, F1 Over Epochs")
+        axs[2].set_xlabel("Epoch")
+        axs[2].set_ylabel("Score")
+        axs[2].legend()
+        axs[2].grid(True)
+
+        plt.savefig(os.path.join(out_dir, "metrics.png"))
+        plt.close()
 
 
-def plot_weight_histogram(trainer):
-    """
-    Plot histogram of all weights in the model (TCN + final layer).
-
-    Args:
-        trainer: Trainer instance containing the model and weights
-    """
-    all_weights = []
-
-    # Collect weights and biases from TCN layers
-    for (w, _), b in zip(trainer.model.weights, trainer.model.biases):
-        all_weights.append(w.flatten())
-        all_weights.append(b.flatten())
-
-    # Collect final layer weights and bias
-    all_weights.append(trainer.fc_w.flatten())
-    all_weights.append(trainer.fc_b.flatten())
-
-    all_weights = np.concatenate(all_weights)
-
-    plt.figure(figsize=(8, 5))
-    plt.hist(all_weights, bins=50, color='c', edgecolor='k', alpha=0.7)
-    plt.title("Histogram of Model Weights")
-    plt.xlabel("Weight value")
-    plt.ylabel("Frequency")
-    plt.grid(True)
-    plt.show()
-
-
-# ------------- Main Execution -------------
-
+# --- Main ---
 if __name__ == "__main__":
-    print("Loading data...")
-    X, y = load_data(DATA_DIR)
-    print(f"Loaded {len(X)} samples, positive samples (\"{TARGET_WORD}\"): {np.sum(y)}")
-
-    # Split into training and validation sets
-    split_idx = int(len(X) * TRAIN_TEST_SPLIT)
-    X_train, y_train = X[:split_idx], y[:split_idx]
-    X_val, y_val = X[split_idx:], y[split_idx:]
-    print(f"Total samples: {len(X)}")
-    print(f"Training samples: {len(X_train)}")
-    print(f"Validation samples: {len(X_val)}")
-    print(f"Training samples: {len(X_train)}, Validation samples: {len(X_val)}")
-
-    # Initialize trainer
-    trainer = Trainer()
-
-    # Train the model
-    trainer.train(X_train, y_train, X_val, y_val)
-
-    # Save trained weights to disk
-    trainer.save_weights()
-
-    # Plot histogram of learned weights
-    plot_weight_histogram(trainer)
-
-    print("Training complete.")
+    trainer = Trainer(data_dir=DATA_DIR, target_word=TARGET_WORD)
+    trainer.train()
+    trainer.save()
+    trainer.plot_metrics()

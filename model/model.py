@@ -1,77 +1,61 @@
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-def relu(x):
-    return np.maximum(0, x)
 
-def temporal_conv1d(x, weights, bias, dilation=1):
-    """
-    Causal dilated 1D convolution.
-
-    Args:
-        x: input (T, C_in)
-        weights: (K, C_in, C_out)
-        bias: (C_out,)
-        dilation: dilation factor
-
-    Returns:
-        output (T, C_out)
-    """
-    T, C_in = x.shape
-    K, _, C_out = weights.shape
-    pad = dilation * (K - 1)
-    x_padded = np.pad(x, ((pad, 0), (0, 0)), mode='constant')
-
-    out = np.zeros((T, C_out))
-    for t in range(T):
-        for k in range(K):
-            t_in = t + pad - dilation * k
-            if t_in >= 0:
-                out[t] += x_padded[t_in] @ weights[k]
-        out[t] += bias
-    return out
-
-class DilatedTCN:
-    def __init__(self, in_channels, hidden_channels, out_channels, kernel_size=3, num_layers=4):
+class DilatedTCN(nn.Module):
+    def __init__(self, input_channels, num_layers, hidden_channels, kernel_size=3, num_classes=1):
         """
-        Multi-layer dilated TCN with exponentially increasing dilation.
+        Dilated Temporal Convolutional Network for sequence modeling.
 
         Args:
-            in_channels: input channels (e.g. 16 for MFCC)
-            hidden_channels: channels in hidden layers
-            out_channels: final embedding size
-            kernel_size: convolution kernel size (usually 3)
-            num_layers: number of TCN layers
+            input_channels (int): Number of input channels/features per timestep (e.g. MFCC coeffs).
+            num_layers (int): Number of TCN layers.
+            hidden_channels (int): Number of channels in hidden TCN layers.
+            kernel_size (int): Kernel size for convolution (usually small like 3).
+            num_classes (int): Number of output classes. Use 1 for binary classification.
         """
+        super(DilatedTCN, self).__init__()
+
         self.num_layers = num_layers
-        self.kernel_size = kernel_size
-        self.weights = []
-        self.biases = []
+        self.tcn_layers = nn.ModuleList()
 
-        # Initialize weights for each layer
-        for l in range(num_layers):
-            dilation = 2 ** l
-            in_c = in_channels if l == 0 else hidden_channels
-            out_c = out_channels if l == num_layers - 1 else hidden_channels
-            w = np.random.randn(kernel_size, in_c, out_c) * np.sqrt(2 / in_c)
-            b = np.zeros(out_c)
-            self.weights.append((w, dilation))
-            self.biases.append(b)
+        for i in range(num_layers):
+            dilation = 2 ** i
+            in_ch = input_channels if i == 0 else hidden_channels
+            conv = nn.Conv1d(
+                in_channels=in_ch,
+                out_channels=hidden_channels,
+                kernel_size=kernel_size,
+                padding=(kernel_size - 1) * dilation,
+                dilation=dilation
+            )
+            self.tcn_layers.append(conv)
 
-    def __call__(self, x):
+        # Final linear layer to map hidden_channels to num_classes
+        self.fc = nn.Linear(hidden_channels, num_classes)
+
+    def forward(self, x):
         """
-        Forward pass through all layers.
+        Forward pass.
 
         Args:
-            x: input array (T, in_channels)
+            x: Tensor of shape (batch_size, input_channels, sequence_length)
 
         Returns:
-            embedding vector (out_channels,)
+            logits: Tensor of shape (batch_size, num_classes)
         """
-        h = x
-        for i in range(self.num_layers):
-            w, dilation = self.weights[i]
-            b = self.biases[i]
-            h = temporal_conv1d(h, w, b, dilation=dilation)
-            h = relu(h)
-        # Global average pooling over time axis
-        return np.mean(h, axis=0)
+        out = x
+        for conv in self.tcn_layers:
+            out = conv(out)
+            # Remove padding on right side to keep causal conv shape
+            padding_amount = conv.padding[0]
+            if padding_amount > 0:
+                out = out[:, :, :-padding_amount]
+            out = F.relu(out)
+
+        # Global average pooling over time dimension
+        out = out.mean(dim=2)  # shape: (batch_size, hidden_channels)
+
+        logits = self.fc(out)  # shape: (batch_size, num_classes)
+        return logits
