@@ -1,4 +1,4 @@
-# Binary classification: <target_word> vs. the rest
+﻿# Binary classification: <target_word> vs. the rest
 task:
   type: "binary"
 
@@ -13,3 +13,4 @@ train:
 
 model:
   num_classes: 1               # BCEWithLogitsLoss expects 1 output
+

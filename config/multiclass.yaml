@@ -1,4 +1,4 @@
-# Multiclass classification: pick one of K words
+﻿# Multiclass classification: pick one of K words
 task:
   type: "multiclass"
 
@@ -14,3 +14,4 @@ train:
 
 model:
   num_classes: 12              # set to len(class_list) if you specify it
+

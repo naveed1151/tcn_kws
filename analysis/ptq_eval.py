@@ -39,18 +39,36 @@ def deep_update(dst, src):
             dst[k] = v
     return dst
 
+def _load_yaml_with_encodings(path):
+    import yaml
+    # Try UTF-8 first; then UTF-8 with BOM; then cp1252 as a last resort.
+    for enc in ("utf-8", "utf-8-sig", "cp1252"):
+        try:
+            with open(path, "r", encoding=enc) as f:
+                return yaml.safe_load(f)
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeDecodeError("yaml", b"", 0, 1, f"Could not decode {path} with utf-8/utf-8-sig/cp1252")
+
 def load_config(path):
-    with open(path, "r") as f:
-        cfg_task = yaml.safe_load(f)
+    cfg_task = _load_yaml_with_encodings(path)
+
+    # Optional base.yaml merge (same pattern you use elsewhere)
+    import os
+    from copy import deepcopy
+    def deep_update(dst, src):
+        for k, v in src.items():
+            if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                deep_update(dst[k], v)
+            else:
+                dst[k] = v
+        return dst
 
     base_path = os.path.join(os.path.dirname(path), "base.yaml")
     if os.path.basename(path) != "base.yaml" and os.path.exists(base_path):
-        with open(base_path, "r") as f:
-            cfg_base = yaml.safe_load(f)
+        cfg_base = _load_yaml_with_encodings(base_path)
         return deep_update(deepcopy(cfg_base), cfg_task)
     return cfg_task
-
-
 # -----------------------
 # Dataset wrappers (mirrors training)
 # -----------------------
@@ -99,7 +117,7 @@ class MultiClassDataset(Dataset):
 
 def make_datasets(cfg, which="val", batch_size=64):
     """Return DataLoader over requested split: 'train'|'val'|'full'."""
-    full = MFCCDataset(cfg["data"]["data_dir"])
+    full = MFCCDataset(cfg["data"]["preprocessed_dir"])
     label_to_index = full.label_to_index
     index_to_word = {v: k for k, v in label_to_index.items()}
 
@@ -141,7 +159,7 @@ def make_datasets(cfg, which="val", batch_size=64):
 # -----------------------
 def build_model_from_cfg(cfg, num_classes, device):
     # Probe a sample to get input_channels/seq_len
-    probe_ds = MFCCDataset(cfg["data"]["data_dir"])
+    probe_ds = MFCCDataset(cfg["data"]["preprocessed_dir"])
     x0, _ = probe_ds[0]
     input_channels = x0.shape[0]
     seq_len = x0.shape[1]
