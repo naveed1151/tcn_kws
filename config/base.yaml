@@ -1,0 +1,45 @@
+# Common defaults for both binary and multiclass runs
+
+data:
+  preprocessed_dir: "data/preprocessed"
+  val_split: 0.20
+  test_split: 0.10
+
+  # where raw audio lives
+  raw_dir: "data/speech_commands_v0.02"
+
+  # MFCC/feature extraction settings
+  mfcc:
+    sample_rate: 16000         # sr
+    n_mfcc: 28
+    frame_length_s: 0.032       # seconds
+    hop_length_s: 0.016         # seconds
+    fixed_duration_s: 1.024      # seconds (pad/truncate)
+
+augmentation:
+  enable: true               # turn off by setting false
+  max_shift_ms: 100          # “up to 100 ms forward/backward shifts”
+  noise_prob: 0.15           # 15% chance to add noise after the shift
+  noise_std_factor: 0.05     # noise std = noise_std_factor * per-sample feature std
+  seed: 0                    # optional; set null to get fully random every run
+
+train:
+  batch_size: 32
+  num_epochs: 30
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  device: "auto"           # "auto" | "cuda" | "cpu"
+
+model:
+  hidden_channels: 26
+  kernel_size: 3
+  dropout: 0.2
+
+output:
+  weights_path: "model_weights.pt"
+  plots_dir: "plots"
+  metrics_figure: "metrics.png"
+  tqdm: true
+
+
+  

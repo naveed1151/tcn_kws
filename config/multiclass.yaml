@@ -1,0 +1,16 @@
+# Multiclass classification: pick one of K words
+task:
+  type: "multiclass"
+
+data:
+  # Optional: limit to a subset. If null, use all labels from MFCCDataset
+  class_list: null             # e.g., ["yes", "no", "up", "down", "bird"]
+  # For multiclass we don't downsample negatives; remove or ignore
+
+train:
+  # Optional class weights if imbalanced; set to null to disable
+  class_weights: null          # e.g., [1.0, 1.5, 0.8, ...] length=K
+  label_smoothing: 0.0         # CrossEntropyLoss(label_smoothing=...)
+
+model:
+  num_classes: 12              # set to len(class_list) if you specify it

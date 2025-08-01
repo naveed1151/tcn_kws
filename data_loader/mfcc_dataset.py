@@ -7,18 +7,22 @@ class MFCCDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         """
         Args:
-            root_dir (str): Path to preprocessed data directory
-            transform (callable, optional): Optional transform to apply on a sample
+            root_dir (str): Path to preprocessed data directory (contains one subfolder per label)
+            transform (callable, optional): Optional transform applied on a sample tensor shaped (C, T)
         """
         self.root_dir = root_dir
         self.transform = transform
-        
-        self.samples = []
-        self.label_to_index = {}
+
+        self.samples = []          # list of (file_path, label_idx)
+        self.label_to_index = {}   # e.g., {"yes":0, "no":1, ...}
         self._prepare_dataset()
+
+        # quick access to labels only (no I/O)
+        self.labels = [lbl for _, lbl in self.samples]
 
     def _prepare_dataset(self):
         label_idx = 0
+        # Stable ordering for reproducibility
         for label_name in sorted(os.listdir(self.root_dir)):
             label_path = os.path.join(self.root_dir, label_name)
             if not os.path.isdir(label_path):
@@ -26,9 +30,9 @@ class MFCCDataset(Dataset):
             if label_name not in self.label_to_index:
                 self.label_to_index[label_name] = label_idx
                 label_idx += 1
-            
-            for fname in os.listdir(label_path):
-                if fname.endswith('.npy'):
+
+            for fname in sorted(os.listdir(label_path)):
+                if fname.lower().endswith(".npy"):
                     file_path = os.path.join(label_path, fname)
                     self.samples.append((file_path, self.label_to_index[label_name]))
 
@@ -37,30 +41,34 @@ class MFCCDataset(Dataset):
 
     def __getitem__(self, idx):
         file_path, label = self.samples[idx]
+
+        # mfcc saved as (time, n_mfcc) in your preprocessor => transpose to (C, T)
+        # If needed, set allow_pickle=False for safety.
         mfcc = np.load(file_path)
-        # Convert to float32 tensor, shape: (time, features)
-        mfcc_tensor = torch.from_numpy(mfcc).float()
-        
-        if self.transform:
-            mfcc_tensor = self.transform(mfcc_tensor)
-        
-        return mfcc_tensor, label
+        x = torch.from_numpy(mfcc).float()        # (T, C)
+        x = x.transpose(0, 1).contiguous()        # (C, T)
 
-# Example usage:
+        if self.transform is not None:
+            x = self.transform(x)                 # transform expects (C, T)
 
+        return x, label
+
+
+# Example quick check
 if __name__ == "__main__":
-    dataset = MFCCDataset("data/preprocessed")
-    
-    # Split into train and val sets (e.g., 80/20)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+    ds = MFCCDataset("data/preprocessed")
+    print("Num samples:", len(ds))
+    x0, y0 = ds[0]
+    print("First item:", x0.shape, y0)           # expect (C, T), e.g., (16 or 28, ~60-100)
+
+    # Simple split (your training code does stratified splits anyway)
+    train_size = int(0.8 * len(ds))
+    val_size = len(ds) - train_size
+    train_set, val_set = torch.utils.data.random_split(ds, [train_size, val_size])
 
     train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=16, shuffle=False)
+    val_loader   = DataLoader(val_set, batch_size=16, shuffle=False)
 
-    # Iterate over one batch to check
-    for batch_x, batch_y in train_loader:
-        print("Batch X shape:", batch_x.shape)  # (batch_size, time, features)
-        print("Batch y shape:", batch_y.shape)
-        break
+    bx, by = next(iter(train_loader))
+    print("Batch X shape:", bx.shape)            # (B, C, T)
+    print("Batch y shape:", by.shape)            # (B,)

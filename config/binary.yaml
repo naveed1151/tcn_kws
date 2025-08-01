@@ -1,0 +1,15 @@
+# Binary classification: <target_word> vs. the rest
+task:
+  type: "binary"
+
+data:
+  target_word: "bird"
+  neg_downsample_ratio: 3.0   # e.g., 3.0 keeps 1 pos : 3 neg
+
+train:
+  pos_weight: null             # e.g., 30.0 (N_neg/N_pos estimate)
+  threshold: 0.5               # sigmoid threshold; null => 0.5
+  auto_threshold: false
+
+model:
+  num_classes: 1               # BCEWithLogitsLoss expects 1 output
