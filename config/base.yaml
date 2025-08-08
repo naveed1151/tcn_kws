@@ -25,10 +25,17 @@ augmentation:
 
 train:
   batch_size: 32
-  num_epochs: 30
+  num_epochs: 20
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
   device: "auto"           # "auto" | "cuda" | "cpu"
+
+qat:
+  weight_bits: 2
+  act_bits: 3
+  symmetric: true
+  per_channel: false
+  observer: "minmax"  # or "ema", "percentile", etc.
 
 model:
   hidden_channels: 26
@@ -36,7 +43,7 @@ model:
   dropout: 0.2
 
 output:
-  weights_path: "model_weights.pt"
+  weights_dir: "checkpoints"
   plots_dir: "plots"
   metrics_figure: "metrics.png"
   tqdm: true

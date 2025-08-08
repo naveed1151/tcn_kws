@@ -19,10 +19,10 @@ use_random_weights = False
 # --- Load Dataset ---
 dataset = MFCCDataset(DATA_DIR)
 label_to_index = dataset.label_to_index
-index_to_word = {v: k for k, v in label_to_index.items()}
+index_to_label = {v: k for k, v in label_to_index.items()}
 
 # Convert to binary classification: target_word → 1, others → 0
-filtered = [(x, 1 if index_to_word[y] == TARGET_WORD else 0) for x, y in dataset]
+filtered = [(x, 1 if index_to_label[y] == TARGET_WORD else 0) for x, y in dataset]
 X = torch.stack([item[0] for item in filtered])
 y = torch.tensor([item[1] for item in filtered], dtype=torch.float32)
 

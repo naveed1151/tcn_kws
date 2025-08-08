@@ -22,7 +22,39 @@ from typing import Dict, Optional, List, Tuple
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from copy import deepcopy
 
+import yaml
+from model.model import DilatedTCN
+from data_loader.mfcc_dataset import MFCCDataset
+
+
+
+def deep_update(dst, src):
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            deep_update(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
+
+
+def load_config(path):
+    def _load_yaml(path):
+        for enc in ("utf-8", "utf-8-sig", "cp1252"):
+            try:
+                with open(path, "r", encoding=enc) as f:
+                    return yaml.safe_load(f)
+            except UnicodeDecodeError:
+                continue
+        raise UnicodeDecodeError(f"Cannot decode: {path}")
+
+    cfg_task = _load_yaml(path)
+    base_path = os.path.join(os.path.dirname(path), "base.yaml")
+    if os.path.basename(path) != "base.yaml" and os.path.exists(base_path):
+        cfg_base = _load_yaml(base_path)
+        return deep_update(deepcopy(cfg_base), cfg_task)
+    return cfg_task
 
 # -----------------------------
 # IO helpers
@@ -157,17 +189,19 @@ def overall_histogram(state_dict: Dict[str, torch.Tensor], outdir: str, bins: in
 # Collect weight arrays
 # -----------------------------
 def collect_weight_arrays(state_dict: Dict[str, torch.Tensor]) -> List[np.ndarray]:
-    """Collect flattened arrays for all .weight tensors (float)."""
+    """Collect flattened arrays for all .weight or .weight_fake_quant tensors (float)."""
     arrs = []
     for name, t in state_dict.items():
         if not isinstance(t, torch.Tensor):
             continue
         if not t.dtype.is_floating_point:
             continue
-        if not name.endswith(".weight"):
-            continue
-        arrs.append(t.detach().cpu().numpy().ravel())
+        if name.endswith(".weight") or name.endswith(".weight_fake_quant.scale"):
+            continue  # skip fake quant metadata
+        if "weight" in name and ".scale" not in name:
+            arrs.append(t.detach().cpu().numpy().ravel())
     return arrs
+
 
 
 # -----------------------------
@@ -227,22 +261,23 @@ def quantize_state_dict_to_codes(
     scheme: str = "per_channel",
 ) -> np.ndarray:
     """
-    Quantize ALL .weight tensors to integer codes and return one concatenated array of codes.
-    This makes histogram binning trivial and exactly aligned with quantization levels.
+    Quantize all .weight tensors (or extract quantized integer codes if available).
     """
-    codes: List[np.ndarray] = []
+    codes = []
+
     for name, t in state_dict.items():
-        if not isinstance(t, torch.Tensor):
-            continue
-        if not t.dtype.is_floating_point:
+        if not isinstance(t, torch.Tensor) or not t.dtype.is_floating_point:
             continue
         if not name.endswith(".weight"):
             continue
+
+        w = t.detach()
         if scheme == "per_channel":
-            q = quantize_codes_per_channel(t, bits=bits, ch_axis=0)
+            q = quantize_codes_per_channel(w, bits=bits, ch_axis=0)
         else:
-            q, _ = quantize_codes_per_tensor(t, bits=bits)
+            q, _ = quantize_codes_per_tensor(w, bits=bits)
         codes.append(q)
+
     if not codes:
         return np.array([], dtype=np.float32)
     return np.concatenate(codes, axis=0)
@@ -403,6 +438,41 @@ def main():
 
     ensure_dir(args.outdir)
     sd = load_state_dict(args.weights)
+
+    # --- Load config and print model ---
+    config_path = os.path.abspath(os.path.join(os.path.dirname(args.weights), "..", "config", "multiclass.yaml"))
+    
+    if os.path.exists(config_path):
+        cfg = load_config(config_path)
+        base = MFCCDataset(cfg["data"]["preprocessed_dir"])
+        in_ch, seq_len = base[0][0].shape
+        num_classes = cfg["model"].get("num_classes") or len(cfg["task"]["class_list"]) + \
+               int(cfg["task"].get("include_unknown", False)) + \
+               int(cfg["task"].get("include_background", False))
+        k = int(cfg["model"]["kernel_size"])
+        h = int(cfg["model"]["hidden_channels"])
+        d = float(cfg["model"]["dropout"])
+        # Compute number of layers
+        def calc_layers(seq_len, k, base=2):
+            L, rf = 0, 1
+            while rf < seq_len:
+                rf += (k - 1) * (base ** L)
+                L += 1
+            return L
+        L = calc_layers(seq_len, k)
+
+        model = DilatedTCN(input_channels=in_ch, num_layers=L, hidden_channels=h,
+                        kernel_size=k, num_classes=num_classes, dropout=d)
+        print("[MODEL ARCHITECTURE]")
+        print(model)
+    else:
+        print("[WARN] Could not find config file to print model architecture.")
+
+    # --- Print loaded state_dict keys and tensor shapes ---
+    print("\n[STATE_DICT CONTENTS]")
+    for k, v in sd.items():
+        if isinstance(v, torch.Tensor):
+            print(f"{k:<40} {tuple(v.shape)}")
 
     # 1) Overall float histogram (weights + biases)
     overall_histogram(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
