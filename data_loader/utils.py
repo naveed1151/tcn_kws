@@ -2,8 +2,8 @@
 
 import numpy as np
 import random
-
-from torch.utils.data import DataLoader, Subset
+import torch
+from torch.utils.data import DataLoader, Subset, Dataset
 
 from data_loader.mfcc_dataset import MFCCDataset
 from data_loader.binary_dataset import BinaryClassDataset
@@ -29,77 +29,172 @@ def stratified_train_val_test_indices(labels, val_frac, test_frac, seed=0):
     rng.shuffle(test_idx)
     return train_idx, val_idx, test_idx
 
+def make_datasets(cfg, which="all", batch_size=64):
+    """
+    Build DataLoaders for train/val/test following config, and return:
+      (train_loader, val_loader, test_loader, train_dataset_wrapped)
 
-def make_datasets(cfg, which="train", batch_size=64):
-    root = cfg["data"]["preprocessed_dir"]
-    val_split = float(cfg["data"]["val_split"])
-    test_split = float(cfg["data"]["test_split"])
-    shuffle = bool(cfg["data"].get("shuffle", True))
-    seed = cfg["data"].get("split_seed", 42)
+    Unknown downsampling caps (task.unknown_max_ratio / unknown_max_count) apply to TRAIN ONLY.
+    """
+    data_cfg = cfg.get("data", {})
+    task_cfg = cfg.get("task", {})
+    train_cfg = cfg.get("train", {})
 
-    task_type = cfg["task"]["type"]
-    class_list = list(cfg["task"]["class_list"])
-    include_unknown = bool(cfg["task"].get("include_unknown", False))
-    include_background = bool(cfg["task"].get("include_background", False))
-    background_label = cfg["data"].get("background_label", "_background_noise_")
+    root = data_cfg.get("preprocessed_dir")
+    if not root:
+        raise ValueError("Config must define data.preprocessed_dir")
 
-    # Final class list and mappings
-    extended_class_list = list(class_list)
-    if include_unknown:
-        extended_class_list.append("unknown")
-    if include_background:
-        extended_class_list.append(background_label)
+    # Split fracs (defaults if not provided)
+    val_frac = float(data_cfg.get("val_frac", 0.1))
+    test_frac = float(data_cfg.get("test_frac", 0.1))
+    seed = int(cfg.get("augmentation", {}).get("seed", 0)) if "augmentation" in cfg else 0
 
-    label_to_index = {label: i for i, label in enumerate(extended_class_list)}
-    index_to_label = {i: label for label, i in label_to_index.items()}
+    # Loader knobs
+    num_workers = int(train_cfg.get("num_workers", 0))
+    pin_memory = bool(train_cfg.get("pin_memory", False))
+    persistent_workers = bool(train_cfg.get("persistent_workers", False)) and num_workers > 0
+    prefetch_factor = train_cfg.get("prefetch_factor", None)
 
-    # Create base dataset (MFCCDataset always used as base)
-    base_dataset = MFCCDataset(root)
+    # Base dataset (raw MFCC items with full label space)
+    base = MFCCDataset(root)
 
-    # Wrap in task-specific dataset
+    # Collect base labels for stratified split
+    base_labels = []
+    for item in base:
+        if isinstance(item, tuple) and len(item) == 2:
+            _, y = item
+        elif isinstance(item, dict):
+            y = item.get("y")
+        else:
+            raise RuntimeError("MFCCDataset items must be (x, y) or {'x':..., 'y':...}")
+        base_labels.append(int(y))
+
+    # Build splits
+    train_idx, val_idx, test_idx = stratified_train_val_test_indices(
+        base_labels, val_frac=val_frac, test_frac=test_frac, seed=seed
+    )
+    base_train = Subset(base, train_idx)
+    base_val = Subset(base, val_idx)
+    base_test = Subset(base, test_idx)
+
+    # Task selection
+    task_type = str(task_cfg.get("type", "multiclass")).lower()
+
     if task_type == "multiclass":
-        dataset = MultiClassDataset(
-            base_dataset, class_list, index_to_label, label_to_index,
+        class_list = list(task_cfg.get("class_list", []))
+        include_unknown = bool(task_cfg.get("include_unknown", True))
+        include_background = bool(task_cfg.get("include_background", True))
+        background_label = data_cfg.get("background_label", "_background_noise_")
+
+        # Train-only caps for unknown
+        unknown_max_ratio = task_cfg.get("unknown_max_ratio", None)
+        unknown_max_count = task_cfg.get("unknown_max_count", None)
+
+        # Wrapped datasets
+        train_ds = MultiClassDataset(
+            base_train,
+            class_list,
+            index_to_label=getattr(base, "index_to_label", None),
+            label_to_index=getattr(base, "label_to_index", None),
             include_unknown=include_unknown,
             include_background=include_background,
-            background_label=background_label
+            background_label=background_label,
+            unknown_max_ratio=unknown_max_ratio,
+            unknown_max_count=unknown_max_count,
+            seed=seed,
+        )
+        val_ds = MultiClassDataset(
+            base_val,
+            class_list,
+            index_to_label=getattr(base, "index_to_label", None),
+            label_to_index=getattr(base, "label_to_index", None),
+            include_unknown=include_unknown,
+            include_background=include_background,
+            background_label=background_label,
+        )
+        test_ds = MultiClassDataset(
+            base_test,
+            class_list,
+            index_to_label=getattr(base, "index_to_label", None),
+            label_to_index=getattr(base, "label_to_index", None),
+            include_unknown=include_unknown,
+            include_background=include_background,
+            background_label=background_label,
         )
     elif task_type == "binary":
-        dataset = BinaryClassDataset(
-            base_dataset, class_list, index_to_label, label_to_index
-        )
+        # Implement if you use BinaryClassDataset; placeholder for now
+        raise NotImplementedError("Binary task path not implemented in make_datasets()")
     else:
-        raise ValueError(f"Unsupported task type: {task_type}")
+        raise ValueError(f"Unknown task.type '{task_type}'")
 
-    # Split
-    num_samples = len(dataset)
-    indices = list(range(num_samples))
-    if shuffle:
-        random.Random(seed).shuffle(indices)
+    # DataLoaders
+    dl_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory)
+    if prefetch_factor is not None and num_workers > 0:
+        dl_kwargs["prefetch_factor"] = int(prefetch_factor)
+        dl_kwargs["persistent_workers"] = persistent_workers
 
-    val_end = int(val_split * num_samples)
-    test_end = val_end + int(test_split * num_samples)
+    train_loader = DataLoader(train_ds, shuffle=True, drop_last=False, **dl_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, drop_last=False, **dl_kwargs)
+    test_loader = DataLoader(test_ds, shuffle=False, drop_last=False, **dl_kwargs)
 
-    val_indices = indices[:val_end]
-    test_indices = indices[val_end:test_end]
-    train_indices = indices[test_end:]
+    return train_loader, val_loader, test_loader,
 
-    train_set = Subset(dataset, train_indices)
-    val_set = Subset(dataset, val_indices)
-    test_set = Subset(dataset, test_indices)
+def get_num_classes(cfg):
+    class_list = list(cfg["task"]["class_list"])
+    if bool(cfg["task"].get("include_unknown", False)):
+        class_list.append("unknown")
+    if bool(cfg["task"].get("include_background", False)):
+        background_label = cfg["data"].get("background_label", "_background_noise_")
+        class_list.append(background_label)
+    return len(class_list)
 
-    if which == "train":
-        return DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    elif which == "val":
-        return DataLoader(val_set, batch_size=batch_size, shuffle=False)
-    elif which == "test":
-        return DataLoader(test_set, batch_size=batch_size, shuffle=False)
-    elif which == "all":
-        return (
-            DataLoader(train_set, batch_size=batch_size, shuffle=True),
-            DataLoader(val_set, batch_size=batch_size, shuffle=False),
-            DataLoader(test_set, batch_size=batch_size, shuffle=False),
-            dataset
-        )
-    else:
-        raise ValueError(f"Unknown dataset split: {which}")
+class MFCCAugment:
+    """Zero-padded time shift + optional Gaussian noise for (C, T) MFCC tensors."""
+    def __init__(self, hop_length_s: float, max_shift_ms: float = 100.0,
+                 noise_prob: float = 0.15, noise_std_factor: float = 0.05, seed=None):
+        import numpy as _np
+        self.hop_length_s = float(hop_length_s)
+        self.max_shift_ms = float(max_shift_ms)
+        self.noise_prob = float(noise_prob)
+        self.noise_std_factor = float(noise_std_factor)
+        self.rng = _np.random.default_rng(seed) if seed is not None else _np.random.default_rng()
+        self.max_shift_frames = int(round((self.max_shift_ms / 1000.0) / self.hop_length_s))
+
+    def _shift_with_zeros(self, x: torch.Tensor, s: int) -> torch.Tensor:
+        C, T = x.shape
+        if s == 0:
+            return x
+        if abs(s) >= T:
+            return torch.zeros_like(x)
+        if s > 0:
+            out = torch.zeros_like(x)
+            out[:, s:] = x[:, :T - s]
+            return out
+        s = -s
+        out = torch.zeros_like(x)
+        out[:, :T - s] = x[:, s:]
+        return out
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if not torch.is_tensor(x):
+            x = torch.tensor(x)
+        if x.ndim != 2:
+            raise ValueError(f"MFCCAugment expects (C, T), got shape {tuple(x.shape)}")
+        C, T = x.shape
+        if self.max_shift_frames > 0 and T > 1:
+            s = int(self.rng.integers(-self.max_shift_frames, self.max_shift_frames + 1))
+            if s != 0:
+                x = self._shift_with_zeros(x, s)
+        return x
+
+class TransformDataset(Dataset):
+    """Wrap a dataset to apply a transform only on __getitem__."""
+    def __init__(self, base: Dataset, transform=None):
+        self.base = base
+        self.transform = transform
+    def __len__(self): return len(self.base)
+    def __getitem__(self, idx):
+        x, y = self.base[idx]
+        if self.transform is not None:
+            x = self.transform(x)
+        return x, y

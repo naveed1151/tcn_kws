@@ -189,16 +189,16 @@ def overall_histogram(state_dict: Dict[str, torch.Tensor], outdir: str, bins: in
 # Collect weight arrays
 # -----------------------------
 def collect_weight_arrays(state_dict: Dict[str, torch.Tensor]) -> List[np.ndarray]:
-    """Collect flattened arrays for all .weight or .weight_fake_quant tensors (float)."""
+    """Collect flattened arrays for all .weight tensors (float)."""
     arrs = []
     for name, t in state_dict.items():
         if not isinstance(t, torch.Tensor):
             continue
         if not t.dtype.is_floating_point:
             continue
-        if name.endswith(".weight") or name.endswith(".weight_fake_quant.scale"):
+        if name.endswith(".weight_fake_quant.scale"):
             continue  # skip fake quant metadata
-        if "weight" in name and ".scale" not in name:
+        if name.endswith(".weight"):
             arrs.append(t.detach().cpu().numpy().ravel())
     return arrs
 
@@ -261,15 +261,16 @@ def quantize_state_dict_to_codes(
     scheme: str = "per_channel",
 ) -> np.ndarray:
     """
-    Quantize all .weight tensors (or extract quantized integer codes if available).
+    Quantize all .weight tensors and return concatenated integer codes.
     """
     codes = []
-
     for name, t in state_dict.items():
-        if not isinstance(t, torch.Tensor) or not t.dtype.is_floating_point:
+        if not isinstance(t, torch.Tensor):
+            continue
+        if not t.dtype.is_floating_point:
             continue
         if not name.endswith(".weight"):
-            continue
+            continue  # Only quantize true weights, skip biases, fake_quant etc.
 
         w = t.detach()
         if scheme == "per_channel":
@@ -279,10 +280,10 @@ def quantize_state_dict_to_codes(
         codes.append(q)
 
     if not codes:
+        print("[WARN] No weight tensors found for quantization.")
         return np.array([], dtype=np.float32)
+
     return np.concatenate(codes, axis=0)
-
-
 # -----------------------------
 # Multi-quant figure (integer-code hist for quantized variants)
 # -----------------------------
@@ -369,6 +370,28 @@ def plot_multi_quant_histograms(
     print(f"[OK] Saved {out_path}")
 
 
+def plot_actual_quantized_weights(state_dict, outdir, show=False):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    os.makedirs(outdir, exist_ok=True)
+    for name, tensor in state_dict.items():
+        if isinstance(tensor, torch.Tensor) and tensor.dtype in (
+            torch.qint8, torch.quint8, torch.int8, torch.uint8
+        ):
+            arr = tensor.int_repr().cpu().numpy().ravel()
+            plt.figure(figsize=(8, 5))
+            plt.hist(arr, bins=np.arange(arr.min()-0.5, arr.max()+1.5, 1), color='C0')
+            plt.title(f"{name} (actual quantized codes)")
+            plt.xlabel("quantized integer code")
+            plt.ylabel("count")
+            plt.grid(True, axis="y", alpha=0.3)
+            out_path = os.path.join(outdir, f"{name.replace('.', '_')}_actual_quant_hist.png")
+            plt.savefig(out_path, bbox_inches="tight")
+            if show:
+                plt.show()
+            plt.close()
+            print(f"[OK] Saved {out_path}")
+            
 # -----------------------------
 # Per-parameter figures (weights & biases)
 # -----------------------------
@@ -432,41 +455,13 @@ def main():
     parser.add_argument("--show", action="store_true", help="Show figures interactively.")
     parser.add_argument("--quant-bits", type=str, default="8,4,3",
                         help="Comma-separated bit widths for multi-quant figure (float is implicit).")
-    parser.add_argument("--quant-scheme", type=str, choices=["per_channel", "per_tensor"], default="per_channel",
+    parser.add_argument("--quant-scheme", type=str, choices=["per_channel", "per_tensor"], default="per_tensor",
                         help="Weight quantization scheme for the multi-quant figure.")
     args = parser.parse_args()
 
     ensure_dir(args.outdir)
     sd = load_state_dict(args.weights)
-
-    # --- Load config and print model ---
-    config_path = os.path.abspath(os.path.join(os.path.dirname(args.weights), "..", "config", "multiclass.yaml"))
-    
-    if os.path.exists(config_path):
-        cfg = load_config(config_path)
-        base = MFCCDataset(cfg["data"]["preprocessed_dir"])
-        in_ch, seq_len = base[0][0].shape
-        num_classes = cfg["model"].get("num_classes") or len(cfg["task"]["class_list"]) + \
-               int(cfg["task"].get("include_unknown", False)) + \
-               int(cfg["task"].get("include_background", False))
-        k = int(cfg["model"]["kernel_size"])
-        h = int(cfg["model"]["hidden_channels"])
-        d = float(cfg["model"]["dropout"])
-        # Compute number of layers
-        def calc_layers(seq_len, k, base=2):
-            L, rf = 0, 1
-            while rf < seq_len:
-                rf += (k - 1) * (base ** L)
-                L += 1
-            return L
-        L = calc_layers(seq_len, k)
-
-        model = DilatedTCN(input_channels=in_ch, num_layers=L, hidden_channels=h,
-                        kernel_size=k, num_classes=num_classes, dropout=d)
-        print("[MODEL ARCHITECTURE]")
-        print(model)
-    else:
-        print("[WARN] Could not find config file to print model architecture.")
+    print("[DEBUG] All state_dict keys:", list(sd.keys()))
 
     # --- Print loaded state_dict keys and tensor shapes ---
     print("\n[STATE_DICT CONTENTS]")
@@ -474,29 +469,34 @@ def main():
         if isinstance(v, torch.Tensor):
             print(f"{k:<40} {tuple(v.shape)}")
 
-    # 1) Overall float histogram (weights + biases)
-    overall_histogram(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
+    # --- Detect quantized weights ---
+    has_quantized = any(
+        isinstance(t, torch.Tensor) and t.dtype in (torch.qint8, torch.quint8, torch.int8, torch.uint8)
+        for t in sd.values()
+    )
 
-    # 2) Per-parameter float histograms
-    visualize_param_histograms(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
-
-    # 3) Multi-quant figure with quantization-aligned bins (integer-code domain)
-    bits_list = parse_bits_list(args.quant_bits)
-    if bits_list:
-        plot_multi_quant_histograms(
-            state_dict=sd,
-            outdir=args.outdir,
-            bits_list=bits_list,
-            scheme=args.quant_scheme,
-            bins_float=args.bins,
-            zero_threshold=args.zero_threshold,
-            show=args.show,
-        )
+    if has_quantized:
+        print("[INFO] Detected quantized weights. Plotting actual quantized histograms only.")
+        plot_actual_quantized_weights(sd, args.outdir, show=args.show)
     else:
-        print("[INFO] No quant bits requested; skipped multi-quant figure.")
+        print("[INFO] Detected floating-point weights. Plotting FP and simulated quantization histograms.")
+        overall_histogram(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
+        visualize_param_histograms(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
+        bits_list = parse_bits_list(args.quant_bits)
+        if bits_list:
+            plot_multi_quant_histograms(
+                state_dict=sd,
+                outdir=args.outdir,
+                bits_list=bits_list,
+                scheme=args.quant_scheme,
+                bins_float=args.bins,
+                zero_threshold=args.zero_threshold,
+                show=args.show,
+            )
+        else:
+            print("[INFO] No quant bits requested; skipped multi-quant figure.")
 
     print(f"[DONE] Outputs written to: {args.outdir}")
-
 
 if __name__ == "__main__":
     main()

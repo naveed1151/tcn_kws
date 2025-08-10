@@ -23,31 +23,74 @@ augmentation:
   noise_std_factor: 0.05     # noise std = noise_std_factor * per-sample feature std
   seed: 0                    # optional; set null to get fully random every run
 
-train:
-  batch_size: 32
-  num_epochs: 20
-  learning_rate: 1.0e-4
-  weight_decay: 1.0e-5
-  device: "auto"           # "auto" | "cuda" | "cpu"
-
-qat:
-  weight_bits: 2
-  act_bits: 3
-  symmetric: true
-  per_channel: false
-  observer: "minmax"  # or "ema", "percentile", etc.
+task:
+  type: multiclass
+  class_list: ["yes", "no", "up", "down", "stop", "go"]
+  include_unknown: true
+  include_background: true
+  # Optional caps for training only
+  unknown_max_ratio: 0.2   # keep at most a * (#keyword samples)
+  unknown_max_count: null   # or an absolute cap (e.g., 5000); null to ignore
 
 model:
+  # Core
   hidden_channels: 26
   kernel_size: 3
   dropout: 0.2
 
+  # Depth (number of residual TCN blocks with exponential dilation)
+  num_blocks: 5
+
+  # Convolutional block options
+  causal: true                      # causal padding + right-trim
+  activation: relu                  # relu | gelu | prelu
+  norm: none                       # batch | group | layer | none
+  groups_for_groupnorm: 8           # only used when norm=group
+  use_weight_norm: false            # apply weight_norm to convs
+  depthwise_separable: false        # use depthwise+pointwise convs
+  pool: avg                         # avg | max (global pool over time)
+  bias: true                        # include bias in conv layers
+#
+train:
+  batch_size: 32
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  device: auto               # "auto" | "cuda" | "cpu"
+
+  # DataLoader performance knobs
+  num_workers: 2             # >0 enables parallel loading (Windows-safe if main-guarded)
+  pin_memory: true           # only helps when using CUDA
+  persistent_workers: true   # keep workers alive across epochs (requires num_workers > 0)
+  prefetch_factor: 2         # batches prefetched per worker
+
+qat:
+  # quant config
+  weight_bits: 4            # start at 8, then step down (e.g., 5 or 4 later)
+  act_bits: 4
+  symmetric: true           # weights symmetric
+  per_channel: true         # per-channel weight quant
+  observer: ema             # "minmax" | "ema" | "percentile"
+  observer_momentum: 0.95
+
+  # training hyperparams (QAT-specific)
+  learning_rate: 1.0e-5     # smaller than train.learning_rate
+  weight_decay: 0.0
+  epochs: 20
+  warmup_epochs: 2          # collect ranges; freeze after warmup
+  freeze_observers_after: 2 # same as warmup_epochs
+  grad_clip_norm: 1.0
+
+  # optional scheduler
+  lr_scheduler:
+    type: cosine            # or "step", "none"
+    min_lr: 1.0e-6
+
 output:
   weights_dir: "checkpoints"
   plots_dir: "plots"
-  metrics_figure: "metrics.png"
   tqdm: true
 
 
-  
+
 

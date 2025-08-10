@@ -15,12 +15,11 @@ from tqdm import tqdm
 from train.utils import (
     _binary_counts, _derive_metrics, _multiclass_confusion_add,
     _multiclass_macro_prf1, compute_confusion_matrix,
-     load_config, TransformDataset, MFCCAugment,
+    load_config, 
     build_model_from_cfg,
-    calc_required_layers
 )
 
-from data_loader.utils import make_datasets
+from data_loader.utils import make_datasets, TransformDataset, MFCCAugment
 from analysis.metrics import plot_metrics, plot_test_confusion_matrix
 
 
@@ -30,8 +29,8 @@ from analysis.metrics import plot_metrics, plot_test_confusion_matrix
 class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
+        # Use task.type from config
         self.task_type = cfg["task"]["type"]  # "binary" or "multiclass"
-        
         # Device
         device_cfg = cfg["train"].get("device", "auto")
         if device_cfg == "cuda":
@@ -41,13 +40,14 @@ class Trainer:
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.train_loader, self.val_loader, self.test_loader, dataset = make_datasets(self.cfg, which="all", batch_size=self.cfg["train"]["batch_size"])
+        # Build datasets/loaders
+        self.train_loader, self.val_loader, self.test_loader = make_datasets(self.cfg, which="all", batch_size=self.cfg["train"]["batch_size"])
         self.train_dataset = self.train_loader.dataset
         self.val_dataset   = self.val_loader.dataset
         self.test_dataset  = self.test_loader.dataset
 
         # Get number of classes from dataset (class_list + unknown/background flags)
-        self.num_classes = self.train_dataset.dataset.num_classes
+        self.num_classes = self.train_dataset.num_classes
         print(f"[INFO] Detected {self.num_classes} classes")
 
         # Augmentation (training split only)
@@ -68,18 +68,47 @@ class Trainer:
 
         # Loaders
         self.batch_size = int(cfg["train"]["batch_size"])
-        self.train_loader = DataLoader(train_set_for_loader, batch_size=self.batch_size, shuffle=True)
-        self.val_loader   = DataLoader(self.val_dataset,   batch_size=self.batch_size, shuffle=False)
-        self.test_loader  = DataLoader(self.test_dataset,  batch_size=self.batch_size, shuffle=False)
 
-        # Model dims
-        sample_x, _ = self.train_dataset[0]
-        input_channels = sample_x.shape[0]
-        seq_len = sample_x.shape[1]
-        self.num_layers = calc_required_layers(seq_len, kernel_size=int(cfg["model"]["kernel_size"]), dilation_base=2)
+        # Configure performant DataLoader options
+        is_cuda = (self.device.type == "cuda")
+        nw = int(cfg["train"].get("num_workers", 0 if not is_cuda else 2))
+        self.pin_memory = bool(cfg["train"].get("persistent_workers", nw > 0))
+        persist = bool(cfg["train"].get("persistent_workers", nw > 0))
+        prefetch = int(cfg["train"].get("prefetch_factor", 2))
 
-        # Model
+        loader_kwargs = {
+            "batch_size": self.batch_size,
+            "shuffle": True,
+            "num_workers": nw,
+            "pin_memory": self.pin_memory,
+        }
+        if nw > 0:
+            loader_kwargs["persistent_workers"] = persist
+            loader_kwargs["prefetch_factor"] = prefetch
+
+        self.train_loader = DataLoader(train_set_for_loader, **loader_kwargs)
+
+        val_kwargs = {
+            "batch_size": self.batch_size,
+            "shuffle": False,
+            "num_workers": nw,
+            "pin_memory": self.pin_memory,
+        }
+        if nw > 0:
+            val_kwargs["persistent_workers"] = persist
+            val_kwargs["prefetch_factor"] = prefetch
+
+        self.val_loader  = DataLoader(self.val_dataset,  **val_kwargs)
+        self.test_loader = DataLoader(self.test_dataset, **val_kwargs)
+
+        # Build model via shared constructor
+        sample_x, _ = self.train_dataset[0]  # (C, T)
+        if sample_x.dim() == 3:  # safety if any wrapper returns (B,C,T)
+            sample_x = sample_x[0]
+        C, T = int(sample_x.shape[0]), int(sample_x.shape[1])
+        print(f"[MFCC dims] channels(C)={C}  timesteps(T)={T}")
         self.model = build_model_from_cfg(cfg, sample_x, self.num_classes).to(self.device)
+        self.input_shape = (C, T)  # save for checkpoint metadata
 
         # Optimizer
         lr = float(cfg["train"]["learning_rate"])
@@ -107,15 +136,16 @@ class Trainer:
                     raise ValueError("class_weights length must equal number of classes.")
                 weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
             self.criterion = nn.CrossEntropyLoss(weight=weight_tensor, label_smoothing=label_smoothing)
-            self.class_names = dataset.class_names  # list[str] length = num_classes
+            self.class_names = self.train_dataset.class_names  # list[str] length = num_classes
 
         self.test_metrics = None
         self.test_confusion = None  # (only for multiclass)
         # Histories / outputs
         self.epochs = int(cfg["train"]["num_epochs"])
         self.plots_dir = cfg["output"]["plots_dir"] + "/training"
-        self.metrics_figure = cfg["output"]["metrics_figure"]
+        self.metrics_figure = os.path.join(self.plots_dir, "metrics.png")
         self.weights_path = os.path.join(cfg["output"]["weights_dir"], "model_weights_fp.pt")
+        self.ckpt_path    = os.path.join(cfg["output"]["weights_dir"], "model_ckpt_fp.pt")
         self.use_tqdm = bool(cfg["output"].get("tqdm", True))
 
         self.train_hist = {"loss": [], "acc": [], "prec": [], "rec": [], "f1": []}
@@ -133,10 +163,6 @@ class Trainer:
         sample_x, _ = self.train_dataset[0]
         C, T = sample_x.shape
         print(f"[MFCC dims] channels(C)={C}  timesteps(T)={T}")
-
-        # If you compute layers dynamically, also print the result
-        k = int(self.cfg["model"]["kernel_size"])
-        print(f"[TCN] kernel_size={k}  computed_num_layers={self.num_layers}")
 
         # Print total number of trainable weights
         total_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -183,7 +209,7 @@ class Trainer:
         with torch.set_grad_enabled(train_mode):
             for batch_x, batch_y in iterator:
                 num_batches += 1
-                batch_x = batch_x.to(self.device)
+                batch_x = batch_x.to(self.device, non_blocking=self.pin_memory)
 
                 if self.task_type == "binary":
                     targets = batch_y.float().unsqueeze(1).to(self.device)
@@ -261,7 +287,7 @@ class Trainer:
 
         for batch_x, batch_y in loader:
             num_batches += 1
-            batch_x = batch_x.to(self.device)
+            batch_x = batch_x.to(self.device, non_blocking=self.pin_memory)
             if self.task_type == "binary":
                 targets = batch_y.float().unsqueeze(1).to(self.device)
             else:
@@ -342,15 +368,35 @@ class Trainer:
             self.test_confusion = cm  # numpy array
 
     def save(self):
+        # Always save plain weights (state_dict) for simple loading
         torch.save(self.model.state_dict(), self.weights_path)
-        print(f"Model saved to {self.weights_path}")
+        print(f"Weights saved to {self.weights_path}")
+
+        # Also save a rich checkpoint with metadata
+        ckpt = {
+            "state_dict": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "epoch": self.epochs,
+            "cfg": self.cfg,
+            "task_type": self.task_type,
+            "num_classes": self.num_classes,
+            "class_names": getattr(self, "class_names", None),
+            "input_shape": self.input_shape,             # (C, T)
+            "binary_threshold": getattr(self, "threshold", None),
+            "train_hist": self.train_hist,
+            "val_hist": self.val_hist,
+            "test_metrics": self.test_metrics,
+        }
+        os.makedirs(os.path.dirname(self.ckpt_path), exist_ok=True)
+        torch.save(ckpt, self.ckpt_path)
+        print(f"Checkpoint (with metadata) saved to {self.ckpt_path}")
 
 # -----------------------
 # Entry
 # -----------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config/binary.yaml")
+    parser.add_argument("--config", type=str, default="config/base.yaml")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -362,8 +408,10 @@ def main():
         raise ValueError("Config 'task.type' must be 'binary' or 'multiclass'.")
 
     # sanity check splits
-    val_frac = float(cfg["data"]["val_split"])
-    test_frac = float(cfg["data"]["test_split"])
+    # Support both val_split/test_split and val_frac/test_frac with sane defaults
+    data_cfg = cfg.get("data", {})
+    val_frac = float(data_cfg.get("val_split", data_cfg.get("val_frac", 0.1)))
+    test_frac = float(data_cfg.get("test_split", data_cfg.get("test_frac", 0.1)))
     if val_frac <= 0 or test_frac <= 0 or (val_frac + test_frac) >= 1.0:
         raise ValueError("Require 0 < val_split, test_split and val_split + test_split < 1.")
 
@@ -372,7 +420,7 @@ def main():
     trainer.save()
     plot_metrics(trainer.train_hist, trainer.val_hist,
              test_metrics=trainer.test_metrics,
-             save_path=os.path.join(trainer.plots_dir, trainer.metrics_figure),
+             save_path=trainer.metrics_figure,
              title_prefix="Binary" if trainer.task_type == "binary" else "Macro")
 
     if trainer.task_type == "multiclass":
