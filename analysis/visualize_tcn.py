@@ -1,103 +1,133 @@
-import os
-import argparse
-import torch
-import torch.nn as nn
-
-from train.utils import load_config, build_model_from_cfg
+"""
+Simple block diagram (rectangles + arrows + residual) for DilatedTCN.
+Outputs an SVG under plots/<outdir>/diagram_blocks.svg
+Heuristic: treats each high‑level temporal block as one box, plus input/output.
+Residual edges drawn dashed (blue). If auto detection fails, use --blocks N.
+"""
+import argparse, os, torch
+from train.train import load_config
+from train.utils import build_model_from_cfg, load_state_dict_forgiving
+from data_loader.utils import make_datasets, get_num_classes
 
 try:
-    from torchviz import make_dot
-except ImportError as e:
-    raise SystemExit(
-        "torchviz is not installed. Install with:\n"
-        "  pip install torchviz\n"
-        "Also install Graphviz and ensure it is on PATH:\n"
-        "  Windows (Chocolatey): choco install graphviz\n"
-        "  Or download from https://graphviz.org/download/"
-    ) from e
+    from graphviz import Digraph
+except ImportError:
+    Digraph = None
 
+def infer_blocks(model):
+    """
+    Return ordered list of block names (heuristic).
+    Looks for modules whose name contains: 'block' or 'dblock' or 'tblock'.
+    Falls back to sequential indices if none found.
+    """
+    candidates = []
+    for name, mod in model.named_children():
+        lname = name.lower()
+        if any(k in lname for k in ("block", "dblock", "tblock")):
+            candidates.append(name)
+    # Dive one level deeper if top-level children are few
+    if len(candidates) <= 1:
+        for name, mod in model.named_modules():
+            if name == "":
+                continue
+            lname = name.lower()
+            if any(k in lname for k in ("block", "dblock", "tblock")) and "." not in name:
+                candidates.append(name)
+    # Remove dupes preserving order
+    seen, ordered = set(), []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
 
-def _infer_num_classes(cfg: dict) -> int:
-    task = cfg.get("task", {})
-    t = task.get("type", "multiclass")
-    if t == "binary":
-        return 1
-    n = len(task.get("class_list", []))
-    if task.get("include_unknown", False):
-        n += 1
-    if task.get("include_background", False):
-        n += 1
-    if n <= 0:
-        raise ValueError("Could not infer num_classes from config.task; provide class_list or set binary task.")
-    return n
+def build_sample(cfg):
+    # Minimal sample using MFCC/time dims implicitly taken from dataset
+    # Use train loader first batch
+    train_loader, _, _ = make_datasets(cfg, which="train", batch_size=1)
+    batch = next(iter(train_loader))
+    x = batch[0] if isinstance(batch, (list, tuple)) else batch["x"]
+    return x[0]  # (C,T)
 
+def load_model(cfg_path, weights_path, device):
+    cfg = load_config(cfg_path)
+    sample = build_sample(cfg)
+    num_classes = get_num_classes(cfg)
+    model = build_model_from_cfg(cfg, sample, num_classes)
+    model = load_state_dict_forgiving(model, weights_path, device)
+    model.to(device).eval()
+    return model, sample.unsqueeze(0)
 
-def _infer_mfcc_shape(cfg: dict) -> tuple[int, int]:
-    # Returns (C, T) expected by build_model_from_cfg
-    mfcc = cfg["data"]["mfcc"]
-    C = int(mfcc["n_mfcc"])
-    hop = float(mfcc["hop_length_s"])
-    dur = float(mfcc["fixed_duration_s"])
-    if hop <= 0 or dur <= 0:
-        raise ValueError("mfcc.hop_length_s and mfcc.fixed_duration_s must be > 0")
-    T = int(round(dur / hop))
-    return C, T
+def make_block_diagram(model, out_svg, forced_blocks=None):
+    if Digraph is None:
+        print("Install graphviz + python bindings: pip install graphviz")
+        return
+    if forced_blocks:
+        blocks = [f"Block{i+1}" for i in range(forced_blocks)]
+    else:
+        inferred = infer_blocks(model)
+        if not inferred:
+            # Fallback: try to read attribute like model.blocks / model.layers length
+            n = 0
+            for attr in ("blocks", "layers"):
+                if hasattr(model, attr):
+                    seq = getattr(model, attr)
+                    try:
+                        n = len(seq)
+                    except:
+                        pass
+                    if n:
+                        break
+            if n == 0:
+                n = 5  # default guess
+            blocks = [f"Block{i+1}" for i in range(n)]
+        else:
+            blocks = inferred
 
+    g = Digraph("TCN", format="svg")
+    # Top-to-bottom layout
+    g.attr(rankdir="TB", splines="spline", nodesep="0.5", ranksep="0.75")
+    g.attr("node", shape="record", style="filled", fillcolor="#f5f8fc",
+           color="#2d4863", fontname="Segoe UI", fontsize="12")
+    g.attr("edge", color="#444444", arrowsize="0.7")
 
-def _select_device(cfg: dict) -> torch.device:
-    pref = str(cfg.get("train", {}).get("device", "auto")).lower()
-    if pref == "cuda":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if pref == "cpu":
-        return torch.device("cpu")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    g.node("Input", label="{ Input | (C,T) }", fillcolor="#e0eef9")
+    prev = "Input"
 
+    # Add each block
+    for i, bname in enumerate(blocks):
+        label = f"{{ {bname} | dilated conv(s) }}"
+        g.node(bname, label=label, fillcolor="#d9ecff")
+        g.edge(prev, bname)
+        # Residual edge (dashed) from first block input to this block output (if beyond first)
+        if i > 0:
+            g.edge("Input" if i == 1 else blocks[i-1],
+                   bname, style="dashed", color="#1d6fb8", arrowhead="none", constraint="false")
+        prev = bname
+
+    g.node("Head", label="{ Classifier | GAP + Linear }", fillcolor="#ffeccb")
+    g.edge(prev, "Head")
+    g.node("Output", label="{ Output | logits }", fillcolor="#e5ffe3")
+    g.edge("Head", "Output")
+
+    g.render(out_svg, cleanup=True)
+    print(f"[OK] Block diagram: {out_svg}.svg")
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--weights", required=True)
+    ap.add_argument("--outdir", default="model_viz", help="Subfolder under plots/")
+    ap.add_argument("--blocks", type=int, default=None, help="Force number of blocks (override auto)")
+    return ap.parse_args()
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize DilatedTCN graph with torchviz")
-    parser.add_argument("--config", "-c", type=str, required=True, help="Path to YAML config (e.g., config/base.yaml)")
-    parser.add_argument("--output", "-o", type=str, default="tcn_graph", help="Output path base name (no extension)")
-    parser.add_argument("--format", "-f", type=str, default="png", choices=["png", "pdf", "svg"], help="Graph format")
-    parser.add_argument("--channels", type=int, default=None, help="Override input channels (MFCCs)")
-    parser.add_argument("--timesteps", type=int, default=None, help="Override input timesteps")
-    parser.add_argument("--dpi", type=int, default=300, help="Raster DPI for PNG/PDF rendering")
-    args = parser.parse_args()
-
-    cfg = load_config(args.config)
-    device = _select_device(cfg)
-    num_classes = _infer_num_classes(cfg)
-
-    # Infer (C, T) from config unless overridden
-    if args.channels is not None and args.timesteps is not None:
-        C, T = int(args.channels), int(args.timesteps)
-    else:
-        C, T = _infer_mfcc_shape(cfg)
-
-    # Build model using the shared constructor (expects sample_input shaped (C, T))
-    sample_input_for_build = torch.zeros(C, T)
-    model = build_model_from_cfg(cfg, sample_input_for_build, num_classes).to(device)
-    model.eval()  # visualization doesn't need training mode
-
-    # Create a real input for forward: (B, C, T)
-    x = torch.randn(1, C, T, device=device, requires_grad=True)
-    y = model(x)
-
-    # Make graph
-    dot = make_dot(y, params=dict(model.named_parameters()))
-    dot.format = args.format
-    # Increase raster resolution (PNG/PDF). For infinite resolution, use --format svg.
-    dot.graph_attr.update({"dpi": str(args.dpi)})
-
-    # Save under plots directory from config (fallback to ./plots)
-    plots_dir = cfg.get("output", {}).get("plots_dir", os.path.join(os.getcwd(), "plots"))
-    # args.output is a base name (no extension), allow subdirs
-    output_base = os.path.join(plots_dir, args.output)
-    os.makedirs(os.path.dirname(output_base), exist_ok=True)
-    out_path = dot.render(output_base, cleanup=True)
-    print(f"[OK] Graph saved to {out_path}")
-    print(f"[INFO] Input shape: (B=1, C={C}, T={T}), Output shape: {tuple(y.shape)}")
-    print(f"[INFO] Device: {device.type}, Num classes: {num_classes}")
-
+    args = parse_args()
+    out_base = os.path.join("plots", args.outdir.lstrip("/\\"))
+    os.makedirs(out_base, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, sample = load_model(args.config, args.weights, device)
+    make_block_diagram(model, os.path.join(out_base, "diagram_blocks"), forced_blocks=args.blocks)
 
 if __name__ == "__main__":
     main()

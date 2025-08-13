@@ -100,6 +100,26 @@ def main():
     for i, name in enumerate(class_names):
         print(f"  {name:>12s}: {test_counts[i]}")
 
+    # Sanity check: compare class priors across splits (focus on 'unknown')
+    tr_total = max(1, sum(train_counts))
+    va_total = max(1, sum(val_counts))
+    te_total = max(1, sum(test_counts))
+    tr_priors = (np.array(train_counts, dtype=float) / tr_total).round(4).tolist()
+    va_priors = (np.array(val_counts, dtype=float) / va_total).round(4).tolist()
+    te_priors = (np.array(test_counts, dtype=float) / te_total).round(4).tolist()
+    print("\n[Priors]")
+    print(f"  train: {tr_priors}")
+    print(f"    val: {va_priors}")
+    print(f"   test: {te_priors}")
+    if "unknown" in class_names:
+        u_idx = class_names.index("unknown")
+        tr_u, va_u, te_u = tr_priors[u_idx], va_priors[u_idx], te_priors[u_idx]
+        diff_val = abs(va_u - tr_u)
+        diff_test = abs(te_u - tr_u)
+        print(f"[Unknown share] train={tr_u:.3f}  val={va_u:.3f} (Δ={diff_val:.3f})  test={te_u:.3f} (Δ={diff_test:.3f})")
+        if diff_val > 0.10:
+            print("[WARN] Validation 'unknown' prior differs from training by >10 percentage points.")
+
     # Totals per split
     print("\n[Totals]")
     print(f"  train total: {sum(train_counts)}")

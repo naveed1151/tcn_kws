@@ -1,9 +1,9 @@
+from __future__ import annotations
+from typing import Dict, Any, Tuple, List, Optional
 import os
 import time
 import argparse
 from copy import deepcopy
-from typing import List, Tuple
-
 import yaml
 import numpy as np
 import torch
@@ -20,14 +20,15 @@ from train.utils import (
 )
 
 from data_loader.utils import make_datasets, TransformDataset, MFCCAugment
-from analysis.metrics import plot_metrics, plot_test_confusion_matrix
+from analysis.plot_metrics import plot_metrics, plot_test_confusion_matrix
+from train.evaluate import evaluate_model
 
 
 # -----------------------
 # Trainer
 # -----------------------
 class Trainer:
-    def __init__(self, cfg):
+    def __init__(self, cfg: Dict[str, Any]) -> None:
         self.cfg = cfg
         # Use task.type from config
         self.task_type = cfg["task"]["type"]  # "binary" or "multiclass"
@@ -187,7 +188,7 @@ class Trainer:
         assert C in (16, 20, 28, 40) or C > 0, f"Unexpected MFCC channels: {C}"
         assert T >= 40, f"Too few time steps ({T}). Check MFCC hop/window/duration."
 
-    def _loop(self, loader, train_mode=True):
+    def _loop(self, loader: DataLoader, train_mode: bool = True) -> Tuple[float, float, float, float, float]:
         if train_mode:
             self.model.train()
         else:
@@ -247,7 +248,7 @@ class Trainer:
             return avg_loss, acc, macro_p, macro_r, macro_f1
 
     # ---------- Threshold search (binary only) ----------
-    def find_best_threshold(self, steps=101):
+    def find_best_threshold(self, steps: int = 101) -> Tuple[float, float]:
         assert self.task_type == "binary", "Threshold search is for binary mode."
         self.model.eval()
         probs_all, y_all = [], []
@@ -275,48 +276,15 @@ class Trainer:
         return best_thr, best_f1
 
     @torch.no_grad()
-    def evaluate(self, loader):
-        """Evaluate current model on a loader using current threshold; returns (loss, acc, P, R, F1)."""
-        self.model.eval()
-        total_loss = 0.0; correct = 0; total = 0; num_batches = 0
-        tp = fp = fn = 0
-        if self.task_type == "multiclass":
-            cm = [[0 for _ in range(self.num_classes)] for _ in range(self.num_classes)]
-        else:
-            cm = None
-
-        for batch_x, batch_y in loader:
-            num_batches += 1
-            batch_x = batch_x.to(self.device, non_blocking=self.pin_memory)
-            if self.task_type == "binary":
-                targets = batch_y.float().unsqueeze(1).to(self.device)
-            else:
-                targets = batch_y.long().to(self.device)
-            logits = self.model(batch_x)
-            loss = self.criterion(logits, targets)
-            total_loss += loss.item()
-
-            if self.task_type == "binary":
-                probs = torch.sigmoid(logits)
-                preds = (probs > self.threshold).long()
-                correct += (preds == targets.long()).sum().item()
-                total += targets.numel()
-                _tp, _fp, _fn, _, _ = _binary_counts(preds, targets)
-                tp += _tp; fp += _fp; fn += _fn
-            else:
-                preds = torch.argmax(logits, dim=1)
-                correct += (preds == targets).sum().item()
-                total += targets.numel()
-                cm = _multiclass_confusion_add(cm, preds, targets, self.num_classes)
-
-        if self.task_type == "binary":
-            return _derive_metrics(total_loss, num_batches, correct, total, tp, fp, fn)
-        else:
-            avg_loss, acc = _derive_metrics(total_loss, num_batches, correct, total)
-            macro_p, macro_r, macro_f1 = _multiclass_macro_prf1(cm)
-            return avg_loss, acc, macro_p, macro_r, macro_f1
-
-    def train(self):
+    def evaluate(self, loader: DataLoader) -> Tuple[float, float, float, float, float]:
+        return evaluate_model(
+            self.model, loader, self.device, self.task_type,
+            self.num_classes, self.criterion,
+            threshold=getattr(self, "threshold", 0.5),
+            pin_memory=self.pin_memory
+        )
+ 
+    def train(self) -> None:
         start = time.perf_counter()
         for epoch in range(1, self.epochs + 1):
             print(f"Epoch {epoch}/{self.epochs}:")
@@ -367,7 +335,7 @@ class Trainer:
             cm = compute_confusion_matrix(self.model, self.test_loader, self.device, self.num_classes)
             self.test_confusion = cm  # numpy array
 
-    def save(self):
+    def save(self) -> None:
         # Always save plain weights (state_dict) for simple loading
         torch.save(self.model.state_dict(), self.weights_path)
         print(f"Weights saved to {self.weights_path}")
@@ -394,7 +362,7 @@ class Trainer:
 # -----------------------
 # Entry
 # -----------------------
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config/base.yaml")
     args = parser.parse_args()

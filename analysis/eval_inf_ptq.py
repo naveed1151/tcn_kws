@@ -6,10 +6,11 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from torch.utils.data import ConcatDataset, DataLoader
 
 from train.utils import (
-    build_model_from_cfg, load_config, _binary_counts, _derive_metrics,
-    _multiclass_confusion_add, _multiclass_macro_prf1
+    build_model_from_cfg, load_config, load_state_dict_forgiving,
+    _binary_counts, _derive_metrics, _multiclass_confusion_add, _multiclass_macro_prf1
 )
 from data_loader.utils import make_datasets, get_num_classes
 
@@ -31,41 +32,6 @@ class ActivationQuantizer(torch.nn.Module):
         x_int = torch.round(x / scale + zero_point).clamp(qmin, qmax)
         x_dequant = (x_int - zero_point) * scale
         return x_dequant
-
-
-def build_and_load_model(cfg, dl, weights_path, num_classes):
-    # Grab ONE sample; avoid using batch dimension as channels
-    sample_batch, _ = next(iter(dl))
-    if sample_batch.dim() == 3:          # (B,C,T)
-        sample_x = sample_batch[0]       # (C,T)
-    else:
-        sample_x = sample_batch          # (C,T)
-
-    # Defensive: enforce channels = first dim
-    in_ch = sample_x.shape[0]
-    model = build_model_from_cfg(cfg, sample_x, num_classes)
-    print(f"[DEBUG] Built model first conv in_channels={model.tcn_layers[0].in_channels} (expected {in_ch})")
-
-    weights = torch.load(weights_path, map_location="cpu")
-    if "state_dict" in weights:
-        print("[INFO] Checkpoint keys:", list(weights.keys()))
-        sd = weights["state_dict"]
-    else:
-        sd = weights
-
-    # Strict load check
-    try:
-        model.load_state_dict(sd, strict=True)
-        print("[INFO] Strict load OK.")
-    except RuntimeError as e:
-        print("[WARN] Strict load failed:\n", e)
-        missing, unexpected = model.load_state_dict(sd, strict=False)
-        print("[WARN] Missing keys:", missing)
-        print("[WARN] Unexpected keys:", unexpected)
-        if missing or unexpected:
-            raise RuntimeError("Model architecture mismatch – aborting quant eval. Fix build_model_from_cfg.")
-
-    return model
 
 
 def is_float_spec(b):
@@ -188,11 +154,31 @@ def main():
         "cuda" if (args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())) else "cpu"
     )
 
-    dl = make_datasets(cfg, which=args.dataset, batch_size=args.batch_size)
+    # Get all splits, then select/compose requested eval loader
+    train_loader, val_loader, test_loader = make_datasets(cfg, which="all", batch_size=args.batch_size)
+    if args.dataset == "train":
+        dl = train_loader
+    elif args.dataset == "val":
+        dl = val_loader
+    elif args.dataset == "test":
+        dl = test_loader
+    else:
+        combo = ConcatDataset([train_loader.dataset, val_loader.dataset, test_loader.dataset])
+        nw = int(cfg.get("train", {}).get("num_workers", 0))
+        pin = bool(cfg.get("train", {}).get("pin_memory", False))
+        dl = DataLoader(combo, batch_size=args.batch_size, shuffle=False, num_workers=nw, pin_memory=pin)
+
     num_classes = get_num_classes(cfg)
     task_type = cfg["task"]["type"]
 
-    model = build_and_load_model(cfg, dl, args.weights, num_classes).to(device).eval()
+    # Build model using the shared factory, using one (C,T) sample from dl
+    batch = next(iter(dl))
+    x = batch[0]
+    sample_x = x[0] if x.dim() == 3 else x  # (C,T)
+    model = build_model_from_cfg(cfg, sample_x, num_classes)
+    # Load weights using the shared forgiving loader
+    model = load_state_dict_forgiving(model, args.weights, device=torch.device("cpu"))
+    model = model.to(device).eval()
 
     per_channel = args.scheme == "per_channel"
     symmetric = args.symmetric

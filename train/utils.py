@@ -193,7 +193,6 @@ def export_quantized_weights_npz(model: nn.Module, path: str) -> None:
     if not isinstance(model, torch.nn.Module):
         raise TypeError("model must be a torch.nn.Module")
 
-    # Collect all quantized weights
     state = model.state_dict()
     weights = {}
     for name, tensor in state.items():
@@ -201,3 +200,80 @@ def export_quantized_weights_npz(model: nn.Module, path: str) -> None:
             weights[name] = tensor.int_repr().cpu().numpy()
     np.savez(path, **weights)
     print(f"[OK] Quantized weights saved to {path}")
+
+# -----------------------
+# Float checkpoint -> NPZ integer codes + scales
+# -----------------------
+def export_quant_from_pt(
+    weights_path: str,
+    out_path: str,
+    bits: int = 5,
+    per_channel: bool = True,
+    symmetric: bool = True,
+) -> List[str]:
+    """
+    Quantize raw float weights from a PyTorch checkpoint to integer codes + scales
+    and store them in an NPZ archive (variable shapes supported via object arrays).
+
+    Args:
+        weights_path: .pt/.pth checkpoint (either raw state_dict or dict with 'state_dict')
+        out_path: destination .npz path (directories auto-created)
+        bits: quantization bit-width (<=16 recommended)
+        per_channel: per-output-channel scaling (first dim) if True, else per-tensor
+        symmetric: symmetric (signed) if True; otherwise unsigned/asymmetric (0..2^bits-1)
+
+    Returns:
+        List of tensor names quantized.
+    """
+    obj = torch.load(weights_path, map_location="cpu")
+    state = obj["state_dict"] if isinstance(obj, dict) and "state_dict" in obj else obj
+
+    qmax = (1 << (bits - 1)) - 1 if symmetric else (1 << bits) - 1
+    qmin = -qmax if symmetric else 0
+
+    names: List[str] = []
+    q_list: List[np.ndarray] = []
+    scale_list: List[np.ndarray] = []
+
+    for name, w in state.items():
+        if not isinstance(w, torch.Tensor):
+            continue
+        if "weight" not in name:
+            continue
+        if w.ndim < 2:  # skip biases / norms
+            continue
+        wf = w.float().cpu()
+        if per_channel:
+            oc = wf.shape[0]
+            flat = wf.view(oc, -1)
+            if symmetric:
+                max_abs = flat.abs().max(dim=1).values
+            else:
+                max_abs = flat.max(dim=1).values
+            scale = torch.where(max_abs == 0, torch.ones_like(max_abs), max_abs / qmax)
+            q = torch.round(flat / scale[:, None]).clamp(qmin, qmax).to(torch.int16)
+            names.append(name)
+            q_list.append(q.numpy())
+            scale_list.append(scale.numpy())
+        else:
+            max_abs = wf.abs().max() if symmetric else wf.max()
+            if max_abs == 0:
+                continue
+            scale = (max_abs / qmax).item()
+            q = torch.round(wf / scale).clamp(qmin, qmax).to(torch.int16)
+            names.append(name)
+            q_list.append(q.numpy())
+            scale_list.append(np.array(scale, dtype=np.float32))
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    np.savez(
+        out_path,
+        names=np.array(names, dtype=object),
+        q_list=np.array(q_list, dtype=object),
+        scale_list=np.array(scale_list, dtype=object),
+        bits=np.array(bits),
+        symmetric=np.array(symmetric),
+        per_channel=np.array(per_channel),
+    )
+    print(f"[OK] Quantized {len(names)} tensors -> {out_path}")
+    return names
