@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import torch
+from typing import Tuple
 
 # Ensure repo root on sys.path so "train.utils" imports work when run as a module/script
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -54,11 +55,27 @@ def _count_params(module: torch.nn.Module) -> tuple[int, int]:
     return trainable, total
 
 
+def _sample_shape_from_dataset(cfg: dict) -> Tuple[int, int]:
+    try:
+        from data_loader.utils import make_datasets
+        loader, _, _ = make_datasets(cfg, which="train", batch_size=1)
+        batch = next(iter(loader))
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch["x"]
+        # Expect shape (B,C,T)
+        if x.ndim == 3:
+            return int(x.shape[1]), int(x.shape[2])
+    except Exception as e:
+        print(f"[WARN] Could not get sample from dataset ({e}); falling back to MFCC heuristic.")
+    return _infer_mfcc_shape(cfg)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Inspect DilatedTCN: parameter counts and per-layer stats")
     parser.add_argument("--config", "-c", type=str, required=True, help="Path to YAML config (e.g., config/base.yaml)")
     parser.add_argument("--channels", type=int, default=None, help="Override input channels (MFCCs)")
     parser.add_argument("--timesteps", type=int, default=None, help="Override input timesteps")
+    parser.add_argument("--use-dataset", action="store_true",
+                        help="Derive (C,T) from first training sample instead of config MFCC heuristics (avoids residual length mismatch)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -69,12 +86,42 @@ def main():
     if args.channels is not None and args.timesteps is not None:
         C, T = int(args.channels), int(args.timesteps)
     else:
-        C, T = _infer_mfcc_shape(cfg)
+        if args.use_dataset:
+            C, T = _sample_shape_from_dataset(cfg)
+        else:
+            C, T = _infer_mfcc_shape(cfg)
 
     # Build model using shared factory (expects sample_input shaped (C, T))
     sample_input_for_build = torch.zeros(C, T)
     model = build_model_from_cfg(cfg, sample_input_for_build, num_classes).to(device)
     model.eval()
+
+    # --- Optional safety patch: auto-trim input time steps on residual mismatch (inspection only) ---
+    # Some residual blocks shrink temporal length (causal convs without full padding) so addition fails.
+    # We wrap forward to retry with progressively trimmed T until it fits, purely for shape inspection.
+    orig_forward = model.forward
+
+    def _forward_autotrim(inp: torch.Tensor):
+        try:
+            return orig_forward(inp)
+        except RuntimeError as e:
+            if "must match the size of tensor" in str(e) and "dimension 2" in str(e):
+                T0 = inp.shape[-1]
+                for trim in range(1, 9):  # try trimming up to 8 frames
+                    if T0 - trim < 4:
+                        break
+                    try:
+                        out = orig_forward(inp[..., :T0 - trim])
+                        if trim > 0:
+                            print(f"[INFO] Auto-trimmed timesteps {T0}->{T0 - trim} to satisfy residual add.")
+                        return out
+                    except RuntimeError as ee:
+                        if "must match the size of tensor" in str(ee):
+                            continue
+                        raise
+            raise
+
+    model.forward = _forward_autotrim  # patch
 
     # Prepare a sample batch for forward
     x = torch.randn(1, C, T, device=device)
@@ -104,8 +151,29 @@ def main():
         hooks.append(module.register_forward_hook(make_hook(name)))
 
     # Forward pass (no grads needed)
-    with torch.no_grad():
-        _ = model(x)
+    def _try_forward(inp: torch.Tensor) -> bool:
+        try:
+            with torch.no_grad():
+                _ = model(inp)
+            return True
+        except RuntimeError as e:
+            if "must match the size of tensor" in str(e) and "dimension 2" in str(e):
+                return False
+            raise
+
+    ok = _try_forward(x)
+    if not ok:
+        # Heuristic: trim input length until forward succeeds (inspection only)
+        orig_T = x.shape[-1]
+        for new_T in range(orig_T - 1, max(4, orig_T - 64), -1):
+            if _try_forward(x[..., :new_T]):
+                T = new_T
+                x = x[..., :new_T]
+                print(f"[INFO] Adjusted timesteps from {orig_T} -> {T} to satisfy residual shape for inspection.")
+                break
+        else:
+            print("[ERROR] Could not auto-fix residual length mismatch; try --use-dataset or --timesteps.")
+            return
 
     # Compute totals
     total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)

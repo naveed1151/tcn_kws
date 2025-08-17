@@ -19,7 +19,6 @@ def plot_metrics(
     test_metrics: Optional[Mapping[str, Union[int, float]]] = None,
     save_path: Optional[str] = None,
     title_prefix: str = "",
-    full_width_test: bool = True
 ) -> None:
     """
     Plots loss and metrics (acc, prec, rec, f1) for train and val.
@@ -36,26 +35,15 @@ def plot_metrics(
         "f1": "F1 Score"
     }
 
+    # Layout: 2 columns. If test_metrics provided, it occupies the next slot
+    # after the 5 metric curves (i.e. row3 col2: index 5) -> no extra row.
     cols = 2
     n_line_plots = len(metrics)  # 5
-    line_rows = (n_line_plots + cols - 1) // cols  # rows for metric curves
-    extra_row = 1 if (test_metrics and full_width_test) else 0
-    total_rows = line_rows + (0 if (test_metrics and not full_width_test) else extra_row)
-
-    if test_metrics and full_width_test:
-        fig = plt.figure(figsize=(12, 3.5 * (line_rows + 0.8)))
-        gs = gridspec.GridSpec(line_rows + 1, cols, height_ratios=[1]*line_rows + [0.9])
-        axes = []
-        for r in range(line_rows):
-            for c in range(cols):
-                axes.append(fig.add_subplot(gs[r, c]))
-        test_ax = fig.add_subplot(gs[line_rows, :])
-    else:
-        n_total = n_line_plots + (1 if test_metrics else 0)
-        rows = (n_total + cols - 1) // cols
-        fig, axes_m = plt.subplots(rows, cols, figsize=(12, 3.5 * rows))
-        axes = axes_m.flatten()
-        test_ax = None
+    n_total = n_line_plots + (1 if test_metrics else 0)
+    rows = (n_total + cols - 1) // cols  # with test_metrics == 6 -> rows=3
+    fig, axes_m = plt.subplots(rows, cols, figsize=(12, 3.3 * rows))
+    axes = axes_m.flatten()
+    test_ax = None
 
     epochs = list(range(1, len(train_hist["loss"]) + 1))
 
@@ -77,18 +65,12 @@ def plot_metrics(
     # Test metrics bar chart integrated into the same figure (last axis)
     used_axes = n_line_plots
     if test_metrics:
-        if full_width_test:
-            axb = test_ax
-        else:
-            axb = axes[n_line_plots]
+        axb = axes[n_line_plots]  # index 5 when test_metrics present
         # Stable order; include only keys present
         order = ["loss", "acc", "prec", "rec", "f1"]
         keys = [k for k in order if k in test_metrics]
         vals = [float(test_metrics[k]) for k in keys]
-        colors = []
-        for k, v in zip(keys, vals):
-            alpha = 0.3 + 0.7 * (v if (k != "loss" and 0 <= v <= 1) else 0.6)
-            colors.append((0.25, 0.6, 0.35, alpha))
+        colors = ["#6baed6" if k != "loss" else "#9ecae1" for k in keys]
         bars = axb.bar(keys, vals, color=colors, edgecolor="black", linewidth=0.7)
         axb.set_title(f"{title_prefix} Test Metrics")
         axb.set_ylabel("Value")
@@ -100,7 +82,7 @@ def plot_metrics(
                          xytext=(0, 4), textcoords="offset points",
                          ha="center", va="bottom", fontsize=9)
         axb.grid(axis="y", alpha=0.3)
-        used_axes += (0 if full_width_test else 1)
+        used_axes += 1
 
     # Hide any leftover empty axes
     for i in range(used_axes, len(axes)):
@@ -110,11 +92,9 @@ def plot_metrics(
     fig.suptitle(title_prefix.strip(), fontsize=14 if title_prefix else 0)
 
     if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=300)
-        print(f"[Saved] Metrics plot to {save_path}")
-    else:
-        plt.show()
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=150)
+    plt.close(fig)
 
 
 def plot_test_bars(

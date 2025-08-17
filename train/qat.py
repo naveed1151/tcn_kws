@@ -590,40 +590,58 @@ def _compute_global_activation_scale(
         zp = torch.round(-a_min / s).item()
     return float(s), float(zp)
 
+def _to_tensor_on(ref: torch.Tensor, val: float) -> torch.Tensor:
+    return torch.as_tensor(float(val), dtype=torch.float32, device=ref.device)
+
+def _set_or_register_buffer(mod: nn.Module, name: str, value: torch.Tensor) -> None:
+    # If already a registered buffer, update in-place
+    if name in mod._buffers and isinstance(mod._buffers[name], torch.Tensor):
+        mod._buffers[name].data.copy_(value)
+        return
+    # If an attribute exists (e.g., None), remove it before registering
+    if hasattr(mod, name):
+        try:
+            delattr(mod, name)
+        except Exception:
+            pass
+    try:
+        mod.register_buffer(name, value)
+    except KeyError:
+        # Fallback: set as a plain attribute
+        setattr(mod, name, value)
+
 @torch.no_grad()
 def _apply_global_weight_scale(model: nn.Module, scale: float, zero_point: float = 0.0) -> None:
+    """
+    Switch all Conv/Linear weight fake-quant modules to use a fixed global scale.
+    Safe when external_* already exist (updates instead of re-registering).
+    """
     for m in model.modules():
-        if isinstance(m, (nn.Conv1d, nn.Linear)) and hasattr(m, "weight_fake"):
-            fq = m.weight_fake
-            if isinstance(fq, CustomFakeQuantize):
-                fq.use_external = True
-                if hasattr(fq, "external_scale") and fq.external_scale is not None:
-                    fq.external_scale.fill_(float(scale))
-                else:
-                    fq.register_buffer("external_scale", torch.tensor(float(scale)))
-                if hasattr(fq, "external_zero_point") and fq.external_zero_point is not None:
-                    fq.external_zero_point.fill_(float(zero_point))
-                else:
-                    fq.register_buffer("external_zero_point", torch.tensor(float(zero_point)))
-                fq.frozen = True
+        if isinstance(m, (nn.Conv1d, nn.Linear)) and hasattr(m, "weight_fake") and isinstance(m.weight_fake, CustomFakeQuantize):
+            fq: CustomFakeQuantize = m.weight_fake
+            ref = fq.scale if isinstance(getattr(fq, "scale", None), torch.Tensor) else next(m.parameters()).detach()
+            _set_or_register_buffer(fq, "external_scale", _to_tensor_on(ref, scale))
+            _set_or_register_buffer(fq, "external_zero_point", _to_tensor_on(ref, zero_point))
+            fq.use_external = True
+            fq.frozen = True
+            fq.enabled = True
 
 @torch.no_grad()
 def _apply_global_activation_scale(model: nn.Module, scale: float, zero_point: float = 0.0) -> None:
+    """
+    Switch all activation fake-quant modules to use a fixed global scale.
+    Safe when external_* already exist (updates instead of re-registering).
+    """
     for m in model.modules():
         for attr in ("input_fake", "output_fake"):
-            if hasattr(m, attr):
-                fq = getattr(m, attr)
-                if isinstance(fq, CustomFakeQuantize):
-                    fq.use_external = True
-                    if hasattr(fq, "external_scale") and fq.external_scale is not None:
-                        fq.external_scale.fill_(float(scale))
-                    else:
-                        fq.register_buffer("external_scale", torch.tensor(float(scale)))
-                    if hasattr(fq, "external_zero_point") and fq.external_zero_point is not None:
-                        fq.external_zero_point.fill_(float(zero_point))
-                    else:
-                        fq.register_buffer("external_zero_point", torch.tensor(float(zero_point)))
-                    fq.frozen = True
+            if hasattr(m, attr) and isinstance(getattr(m, attr), CustomFakeQuantize):
+                fq: CustomFakeQuantize = getattr(m, attr)
+                ref = fq.scale if isinstance(getattr(fq, "scale", None), torch.Tensor) else next(m.parameters()).detach()
+                _set_or_register_buffer(fq, "external_scale", _to_tensor_on(ref, scale))
+                _set_or_register_buffer(fq, "external_zero_point", _to_tensor_on(ref, zero_point))
+                fq.use_external = True
+                fq.frozen = True
+                fq.enabled = True
 
 
 def main() -> None:

@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
+import csv
 
 from train.utils import (
     _binary_counts, _derive_metrics, _multiclass_confusion_add,
@@ -151,6 +152,9 @@ class Trainer:
 
         self.train_hist = {"loss": [], "acc": [], "prec": [], "rec": [], "f1": []}
         self.val_hist   = {"loss": [], "acc": [], "prec": [], "rec": [], "f1": []}
+        # CSV logging path
+        self.csv_path = os.path.join(self.plots_dir, "metrics.csv")
+        self._init_csv_log()
 
         # ---- Sanity checks: dataset sizes and MFCC shapes ----
         print(f"[Split sizes] train={len(self.train_dataset)}  val={len(self.val_dataset)}  test={len(self.test_dataset)}")
@@ -299,6 +303,8 @@ class Trainer:
 
             print(f"  Train | Loss: {tr_loss:.4f}  Acc: {tr_acc:.4f}  P: {tr_p:.4f}  R: {tr_r:.4f}  F1: {tr_f1:.4f}")
             print(f"  Val   | Loss: {va_loss:.4f}  Acc: {va_acc:.4f}  P: {va_p:.4f}  R: {va_r:.4f}  F1: {va_f1:.4f}")
+            # CSV logging per epoch
+            self._append_csv_log(epoch, tr_loss, tr_acc, tr_p, tr_r, tr_f1, va_loss, va_acc, va_p, va_r, va_f1)
 
         elapsed = time.perf_counter() - start
         hrs, rem = divmod(int(elapsed), 3600)
@@ -358,6 +364,37 @@ class Trainer:
         os.makedirs(os.path.dirname(self.ckpt_path), exist_ok=True)
         torch.save(ckpt, self.ckpt_path)
         print(f"Checkpoint (with metadata) saved to {self.ckpt_path}")
+
+    def _init_csv_log(self) -> None:
+        os.makedirs(self.plots_dir, exist_ok=True)
+        if not os.path.exists(self.csv_path):
+            with open(self.csv_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "epoch",
+                    "train_loss","train_acc","train_prec","train_rec","train_f1",
+                    "val_loss","val_acc","val_prec","val_rec","val_f1",
+                    "lr"
+                ])
+
+    def _append_csv_log(
+        self, epoch: int,
+        tr_loss: float, tr_acc: float, tr_p: float, tr_r: float, tr_f1: float,
+        va_loss: float, va_acc: float, va_p: float, va_r: float, va_f1: float
+    ) -> None:
+        # Try to read LR from first param group; fallback to cfg value
+        try:
+            lr = float(self.optimizer.param_groups[0]["lr"])
+        except Exception:
+            lr = float(self.cfg["train"]["learning_rate"])
+        with open(self.csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                int(epoch),
+                float(tr_loss), float(tr_acc), float(tr_p), float(tr_r), float(tr_f1),
+                float(va_loss), float(va_acc), float(va_p), float(va_r), float(va_f1),
+                lr
+            ])
 
 # -----------------------
 # Entry

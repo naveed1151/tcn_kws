@@ -34,12 +34,12 @@ task:
 
 model:
   # Core
-  hidden_channels: 26
-  kernel_size: 3
+  hidden_channels: 22
+  kernel_size: 2
   dropout: 0.2
 
   # Depth (number of residual TCN blocks with exponential dilation)
-  num_blocks: 5
+  num_blocks: 8
 
   # Convolutional block options
   causal: true                      # causal padding + right-trim
@@ -47,13 +47,13 @@ model:
   norm: none                       # batch | group | layer | none
   groups_for_groupnorm: 8           # only used when norm=group
   use_weight_norm: false            # apply weight_norm to convs
-  depthwise_separable: false        # use depthwise+pointwise convs
+  depthwise_separable: false       # use depthwise+pointwise convs
   pool: avg                         # avg | max (global pool over time)
   bias: false                        # include bias in conv layers
 #
 train:
   batch_size: 32
-  num_epochs: 50
+  num_epochs: 100
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
   device: auto               # "auto" | "cuda" | "cpu"
@@ -72,13 +72,13 @@ qat:
   act_symmetric: false
 
   # Use globally fixed scales after warmup (derive from data/observers)
-  weight_use_global_scale: false
-  act_use_global_scale: false
+  weight_use_global_scale: true
+  act_use_global_scale: true
   warmup_epochs: 1
 
   # training hyperparams
   batch_size: 32
-  num_epochs: 20
+  num_epochs: 5
   learning_rate: 1.0e-5
   # Optional: override model.dropout during QAT
   dropout: 0.10
