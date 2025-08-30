@@ -1,5 +1,5 @@
 # tcn_kws
-mchines can hear us
+machines can hear us
 tcn_kws_scratch/
 ├── README.md               # Project overview and instructions
 ├── requirements.txt        # Python dependencies
