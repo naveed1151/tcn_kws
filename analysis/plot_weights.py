@@ -2,7 +2,7 @@
 Visualize trained model weights (state_dict):
 
 1) Overall histogram (float, weights+biases) with zero/non-zero counts.
-2) Per-parameter histograms (weights & biases) with zero/non-zero counts.
+2) Per-layer histograms (weights & biases) with zero/non-zero counts.
 3) Multi-quant figure (weights only):
    - 'float' panel: value-domain histogram (continuous).
    - For quantized variants (e.g., 8/4/3 bit): histogram of quantized INTEGER CODES,
@@ -10,9 +10,9 @@ Visualize trained model weights (state_dict):
    - Each panel shows total zeros and non-zeros. For quantized panels, zeros are exact code=0.
 
 Usage examples:
-  python -m analysis.visualize_model_weights --weights model_weights.pt
-  python -m analysis.visualize_model_weights --weights model_weights.pt --zero-threshold 1e-6
-  python -m analysis.visualize_model_weights --weights model_weights.pt --quant-bits 8,4,3 --quant-scheme per_channel
+  python -m analysis.plot_weights --weights model_weights.pt
+  python -m analysis.plot_weights --weights model_weights.pt --zero-threshold 1e-6
+  python -m analysis.plot_weights --weights model_weights.pt --quant-bits 8,4,3 --quant-scheme global --global-percentile 100
 """
 
 import os
@@ -27,6 +27,12 @@ from copy import deepcopy
 import yaml
 from model.model import DilatedTCN
 from data_loader.mfcc_dataset import MFCCDataset
+from quantization.core import (
+    quantize_weights_global,
+    quantize_weights_per_tensor,
+    quantize_weights_per_channel,
+    qmax_for_bits
+)
 
 
 
@@ -255,35 +261,52 @@ def quantize_codes_per_channel(w: torch.Tensor, bits: int, ch_axis: int = 0) -> 
         return q.view(-1).cpu().numpy()
 
 
-def quantize_state_dict_to_codes(
-    state_dict: Dict[str, torch.Tensor],
-    bits: int,
-    scheme: str = "per_channel",
-) -> np.ndarray:
+def quantize_codes_global(state_dict: Dict[str, torch.Tensor], bits: int, global_percentile: float = 100.0) -> np.ndarray:
     """
-    Quantize all .weight tensors and return concatenated integer codes.
+    Quantize all .weight tensors using a single global scale (symmetric).
+    The scale is set by the given percentile of absolute weights.
+    Returns concatenated integer codes.
     """
-    codes = []
+    weights = []
     for name, t in state_dict.items():
         if not isinstance(t, torch.Tensor):
             continue
         if not t.dtype.is_floating_point:
             continue
         if not name.endswith(".weight"):
-            continue  # Only quantize true weights, skip biases, fake_quant etc.
-
-        w = t.detach()
-        if scheme == "per_channel":
-            q = quantize_codes_per_channel(w, bits=bits, ch_axis=0)
-        else:
-            q, _ = quantize_codes_per_tensor(w, bits=bits)
-        codes.append(q)
-
-    if not codes:
-        print("[WARN] No weight tensors found for quantization.")
+            continue
+        weights.append(t.detach().cpu().numpy().ravel())
+    if not weights:
+        print("[WARN] No weight tensors found for global quantization.")
         return np.array([], dtype=np.float32)
+    all_weights = np.concatenate(weights, axis=0)
+    qmax = qmax_for_bits(bits)
+    max_abs = np.percentile(np.abs(all_weights), global_percentile)
+    if max_abs == 0:
+        q = np.zeros_like(all_weights)
+        return q
+    scale = max_abs / qmax
+    q = np.round(all_weights / scale).clip(-qmax, qmax)
+    return q.astype(np.int32)
 
-    return np.concatenate(codes, axis=0)
+
+def quantize_state_dict_to_codes(
+    state_dict: Dict[str, torch.Tensor],
+    bits: int,
+    scheme: str = "per_channel",
+    global_percentile: float = 100.0,
+) -> np.ndarray:
+    """
+    Quantize all .weight tensors and return concatenated integer codes.
+    Supports: per_channel, per_tensor, global
+    """
+    if scheme == "global":
+        return quantize_weights_global(state_dict, bits, global_percentile)
+    elif scheme == "per_channel":
+        return quantize_weights_per_channel(state_dict, bits, ch_axis=0)
+    else:  # per_tensor
+        return quantize_weights_per_tensor(state_dict, bits)
+
 # -----------------------------
 # Multi-quant figure (integer-code hist for quantized variants)
 # -----------------------------
@@ -295,6 +318,7 @@ def plot_multi_quant_histograms(
     bins_float: int,
     zero_threshold: float,
     show: bool,
+    global_percentile: float = 100.0,
 ):
     """
     Create a figure with subplots:
@@ -316,11 +340,8 @@ def plot_multi_quant_histograms(
     # Quantized variants (integer codes)
     for b in bits_list:
         qmax = qmax_for_bits(b)
-        q_codes = quantize_state_dict_to_codes(state_dict, bits=b, scheme=scheme)  # integers in [-qmax, qmax]
-        # Bin edges centered on each integer level:
-        # e.g., for q in {-2,-1,0,1,2}, edges = [-2.5,-1.5,-0.5,0.5,1.5,2.5]
+        q_codes = quantize_state_dict_to_codes(state_dict, bits=b, scheme=scheme, global_percentile=global_percentile)
         edges = np.arange(-qmax - 0.5, qmax + 1.5, 1.0)
-        # Zero count is exact number of codes == 0
         q_zeros = int(np.count_nonzero(q_codes == 0))
         q_nonzeros = int(q_codes.size - q_zeros)
         variants.append((f"{b}-bit ({scheme})", q_codes, q_zeros, q_nonzeros, edges))
@@ -395,7 +416,7 @@ def plot_actual_quantized_weights(state_dict, outdir, show=False):
 # -----------------------------
 # Per-parameter figures (weights & biases)
 # -----------------------------
-def visualize_param_histograms(
+def plot_per_layer_histograms(
     state_dict: Dict[str, torch.Tensor],
     outdir: str,
     bins: int,
@@ -455,8 +476,12 @@ def main():
     parser.add_argument("--show", action="store_true", help="Show figures interactively.")
     parser.add_argument("--quant-bits", type=str, default="8,4,3",
                         help="Comma-separated bit widths for multi-quant figure (float is implicit).")
-    parser.add_argument("--quant-scheme", type=str, choices=["per_channel", "per_tensor"], default="per_tensor",
+    parser.add_argument("--quant-scheme", type=str, choices=["per_channel", "per_tensor", "global"], default="per_tensor",
                         help="Weight quantization scheme for the multi-quant figure.")
+    parser.add_argument("--global-percentile", type=float, default=100.0,
+                        help="Percentile for global quantization scale (default: 100, i.e. max).")
+    parser.add_argument("--per-layer", action="store_true",
+                        help="If set, save per-parameter (layer) histograms. Default: off.")
     args = parser.parse_args()
 
     ensure_dir(args.outdir)
@@ -480,8 +505,14 @@ def main():
         plot_actual_quantized_weights(sd, args.outdir, show=args.show)
     else:
         print("[INFO] Detected floating-point weights. Plotting FP and simulated quantization histograms.")
+        # Print actual dtype of first floating-point tensor
+        for k, v in sd.items():
+            if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
+                print(f"[INFO] Floating-point dtype: {v.dtype}")
+                break
         overall_histogram(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
-        visualize_param_histograms(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
+        if args.per_layer:
+            plot_per_layer_histograms(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
         bits_list = parse_bits_list(args.quant_bits)
         if bits_list:
             plot_multi_quant_histograms(
@@ -492,6 +523,7 @@ def main():
                 bins_float=args.bins,
                 zero_threshold=args.zero_threshold,
                 show=args.show,
+                global_percentile=args.global_percentile,
             )
         else:
             print("[INFO] No quant bits requested; skipped multi-quant figure.")

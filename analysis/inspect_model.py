@@ -9,7 +9,8 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from train.utils import load_config, build_model_from_cfg  # noqa: E402
+from train.utils import load_config, build_model_from_cfg
+from model.model import DilatedTCN
 
 
 def _infer_num_classes(cfg: dict) -> int:
@@ -91,9 +92,8 @@ def main():
         else:
             C, T = _infer_mfcc_shape(cfg)
 
-    # Build model using shared factory (expects sample_input shaped (C, T))
-    sample_input_for_build = torch.zeros(C, T)
-    model = build_model_from_cfg(cfg, sample_input_for_build, num_classes).to(device)
+    # Build model using shared factory
+    model = build_model_from_cfg(cfg).to(device)
     model.eval()
 
     # --- Optional safety patch: auto-trim input time steps on residual mismatch (inspection only) ---
@@ -182,11 +182,10 @@ def main():
     print(f"[MODEL] Device={device.type}  Input(B,C,T)=(1,{C},{T})  NumClasses={num_classes}")
     print(f"[PARAMS] total={total_params:,}  trainable={total_trainable:,}")
     # Receptive field for DilatedTCN:
-    # Each residual block has two convs with dilation d=2^i, each adds (k-1)*d to RF.
-    # RF = 1 + 2*(k-1) * (2^B - 1)
+    # Use the model's static method for calculation
     k = int(cfg["model"]["kernel_size"])
     B = int(cfg["model"]["num_blocks"])
-    rf = 1 + 2 * (k - 1) * ((2 ** B) - 1)
+    rf = DilatedTCN.receptive_field(k, B)
     print(f"[RECEPTIVE_FIELD] frames={rf}")
     print("\n[Per-layer stats]")
     print(f"{'name':40s} {'type':26s} {'trainable/total':18s} {'out_shape'}")

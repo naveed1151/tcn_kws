@@ -25,7 +25,7 @@ augmentation:
 
 task:
   type: multiclass
-  class_list: ["yes", "no", "up", "down", "stop", "go"]
+  class_list: ["yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"]
   include_unknown: true
   include_background: false
   # Optional caps for training only
@@ -34,12 +34,12 @@ task:
 
 model:
   # Core
-  hidden_channels: 22
-  kernel_size: 2
+  hidden_channels: 26
+  kernel_size: 3
   dropout: 0.2
 
-  # Depth (number of residual TCN blocks with exponential dilation)
-  num_blocks: 8
+  # Depth (number of residual TCN blocks, each with 2 layers (with equal exponential dilation)
+  num_blocks: 4
 
   # Convolutional block options
   causal: true                      # causal padding + right-trim
@@ -50,10 +50,10 @@ model:
   depthwise_separable: false       # use depthwise+pointwise convs
   pool: avg                         # avg | max (global pool over time)
   bias: false                        # include bias in conv layers
-#
+
 train:
   batch_size: 32
-  num_epochs: 100
+  num_epochs: 50
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
   device: auto               # "auto" | "cuda" | "cpu"

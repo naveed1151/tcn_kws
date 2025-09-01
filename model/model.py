@@ -139,7 +139,7 @@ class ResidualBlock1D(nn.Module):
         elif activation == "gelu":
             self.act1 = nn.GELU()
             self.act2 = nn.GELU()
-        else:
+        elif activation == "prelu":
             self.act1 = nn.PReLU(num_parameters=out_ch)
             self.act2 = nn.PReLU(num_parameters=out_ch)
 
@@ -236,7 +236,11 @@ class DilatedTCN(nn.Module):
 
         self.pool = nn.AdaptiveAvgPool1d(1) if pool == "avg" else nn.AdaptiveMaxPool1d(1)
         self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
-        self.fc = nn.Linear(hidden_channels, num_classes)
+        self.fc = nn.Linear(
+                        in_features=hidden_channels,
+                        out_features=num_classes,
+                        bias=bias
+                    )
 
         # He init for convs, kaiming for linear
         self.apply(self._init_weights)
@@ -255,7 +259,7 @@ class DilatedTCN(nn.Module):
                 nn.init.uniform_(m.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (N, C_in, T) → logits: (N, num_classes)"""
+        """x: (N, C_in, T) where N is batch size, C_in is input channels, T is sequence length → logits: (N, num_classes)"""
         out = self.tcn(x)
         out = self.pool(out).squeeze(-1)  # (N, hidden)
         out = self.dropout(out)

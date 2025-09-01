@@ -13,18 +13,16 @@ M = TypeVar("M", bound=nn.Module)
 # Model building
 # -----------------------
 
-def build_model_from_cfg(cfg: Dict[str, Any], sample_input: torch.Tensor, num_classes: int) -> DilatedTCN:
+def build_model_from_cfg(cfg: Dict[str, Any]) -> DilatedTCN:
     """
-    Build the updated DilatedTCN from config and a sample input (C, T).
-    Uses only the new fields in cfg['model'].
+    Build DilatedTCN from config.
+    Uses input_channels from cfg['data']['mfcc']['n_mfcc'], num_classes from cfg['task'].
     """
-    # Expect (C, T)
-    if sample_input.dim() != 2:
-        raise ValueError(f"build_model_from_cfg expects sample_input shaped (C, T), got {tuple(sample_input.shape)}")
-    in_channels = int(sample_input.shape[0])
-    seq_len = int(sample_input.shape[1])
-
     m = cfg["model"]
+    t = cfg["task"]
+    mfcc = cfg["data"]["mfcc"]
+
+    input_channels = int(mfcc["n_mfcc"])
     kernel_size = int(m["kernel_size"])
     hidden_channels = int(m["hidden_channels"])
     dropout = float(m["dropout"])
@@ -38,8 +36,18 @@ def build_model_from_cfg(cfg: Dict[str, Any], sample_input: torch.Tensor, num_cl
     pool = str(m.get("pool", "avg"))
     bias = bool(m.get("bias", True))
 
+    # Get num_classes from task config
+    class_list = t.get("class_list", [])
+    include_unknown = bool(t.get("include_unknown", False))
+    include_background = bool(t.get("include_background", False))
+    num_classes = len(class_list)
+    if include_unknown:
+        num_classes += 1
+    if include_background:
+        num_classes += 1
+
     model = DilatedTCN(
-        input_channels=in_channels,
+        input_channels=input_channels,
         num_blocks=num_blocks,
         hidden_channels=hidden_channels,
         kernel_size=kernel_size,
@@ -59,7 +67,7 @@ def build_model_from_cfg(cfg: Dict[str, Any], sample_input: torch.Tensor, num_cl
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         "[MODEL] DilatedTCN built: "
-        f"in_ch={in_channels}, T={seq_len}, hidden={hidden_channels}, "
+        f"in_ch={input_channels}, hidden={hidden_channels}, "
         f"kernel={kernel_size}, blocks={num_blocks}, dropout={dropout}, classes={num_classes}, "
         f"causal={causal}, act={activation}, norm={norm}, groups={groups_for_groupnorm}, "
         f"dwise_sep={depthwise_separable}, w_norm={use_weight_norm}, pool={pool}, bias={bias}"

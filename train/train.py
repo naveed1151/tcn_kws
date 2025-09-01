@@ -109,7 +109,7 @@ class Trainer:
             sample_x = sample_x[0]
         C, T = int(sample_x.shape[0]), int(sample_x.shape[1])
         print(f"[MFCC dims] channels(C)={C}  timesteps(T)={T}")
-        self.model = build_model_from_cfg(cfg, sample_x, self.num_classes).to(self.device)
+        self.model = build_model_from_cfg(cfg).to(self.device)
         self.input_shape = (C, T)  # save for checkpoint metadata
 
         # Optimizer

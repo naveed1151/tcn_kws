@@ -101,7 +101,7 @@ class KeywordModel:
         fixed_dur = float(self.mfcc_cfg["fixed_duration_s"])
         dummy = np.zeros(int(sr * fixed_dur), dtype=np.float32)
         feat = preprocess_wave(dummy, sr, self.mfcc_cfg, fixed_dur)
-        self.model = build_model_from_cfg(self.cfg, feat, num_classes)
+        self.model = build_model_from_cfg(self.cfg)
         self.model = load_state_dict_forgiving(self.model, weights_path, device)
         self.model.to(device).eval()
 

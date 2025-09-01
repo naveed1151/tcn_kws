@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from torch.utils.data import ConcatDataset, DataLoader
+from typing import Optional, List, Tuple, Dict, Any
 
 from train.utils import (
     build_model_from_cfg, load_config, load_state_dict_forgiving,
@@ -16,12 +17,12 @@ from data_loader.utils import make_datasets, get_num_classes
 
 
 class ActivationQuantizer(torch.nn.Module):
-    def __init__(self, bits=8, symmetric=True):
+    def __init__(self, bits: int = 8, symmetric: bool = True) -> None:
         super().__init__()
         self.bits = bits
         self.symmetric = symmetric
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.bits == 32 or self.bits == "float":
             return x
         qmin = -(2 ** (self.bits - 1)) if self.symmetric else 0
@@ -34,11 +35,11 @@ class ActivationQuantizer(torch.nn.Module):
         return x_dequant
 
 
-def is_float_spec(b):
+def is_float_spec(b: Any) -> bool:
     return str(b).lower() in ("float", "fp", "fp32", "32")
 
 
-def treat_as_float(w_bits, a_bits):
+def treat_as_float(w_bits: Any, a_bits: Any) -> bool:
     # If either side declared float OR both >=16 just bypass (16-bit should be near-lossless)
     return (is_float_spec(w_bits) and is_float_spec(a_bits)) or (
         (not is_float_spec(w_bits) and int(w_bits) >= 16) and
@@ -46,34 +47,30 @@ def treat_as_float(w_bits, a_bits):
     )
 
 
-def quantize_model_weights_and_activations(model, weight_bits=8, act_bits=8, per_channel=True, symmetric=True):
+def quantize_model_weights_and_activations(
+    model: torch.nn.Module,
+    weight_bits: int = 8,
+    act_bits: int = 8,
+    scheme: str = "per_tensor",
+    symmetric: bool = True,
+    global_percentile: float = 100.0
+) -> torch.nn.Module:
     # Bypass path
     if treat_as_float(weight_bits, act_bits):
         return deepcopy(model)
 
+    import quantization.core as qcore
     model = deepcopy(model).cpu().eval()
     # -------- Weights --------
     if not is_float_spec(weight_bits):
         w_bits = int(weight_bits)
-        qmax_w = (1 << (w_bits - 1)) - 1
-        for _, module in model.named_modules():
-            if isinstance(module, (torch.nn.Conv1d, torch.nn.Linear)) and hasattr(module, "weight"):
-                w = module.weight.data
-                if per_channel and w.dim() >= 2:
-                    oc = w.shape[0]
-                    w_flat = w.view(oc, -1)
-                    max_abs = w_flat.abs().max(dim=1).values
-                    scale = max_abs / qmax_w
-                    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-                    q = torch.clamp(torch.round(w_flat / scale[:, None]), -qmax_w, qmax_w)
-                    module.weight.data = (q * scale[:, None]).view_as(w)
-                else:
-                    max_abs = w.abs().max()
-                    if max_abs == 0:
-                        continue
-                    scale = max_abs / qmax_w
-                    q = torch.clamp(torch.round(w / scale), -qmax_w, qmax_w)
-                    module.weight.data = q * scale
+        model = qcore.quantize_model_weights(
+            model,
+            bits=w_bits,
+            scheme=scheme,
+            symmetric=symmetric,
+            global_percentile=global_percentile
+        )
 
     # -------- Activations (only input for now) --------
     if is_float_spec(act_bits) or int(act_bits) >= 16:
@@ -86,7 +83,7 @@ def quantize_model_weights_and_activations(model, weight_bits=8, act_bits=8, per
     orig_forward = model.forward
 
     @torch.no_grad()
-    def new_forward(x):
+    def new_forward(x: torch.Tensor) -> torch.Tensor:
         max_abs = x.abs().max()
         if max_abs == 0:
             return orig_forward(x)
@@ -100,7 +97,14 @@ def quantize_model_weights_and_activations(model, weight_bits=8, act_bits=8, per
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, task_type, threshold=0.5, num_classes=None):
+def evaluate(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    task_type: str,
+    threshold: float = 0.5,
+    num_classes: Optional[int] = None
+) -> Tuple[float, float, float, float]:
     model.eval().to(device)
     total_loss, correct, total, tp, fp, fn = 0.0, 0, 0, 0, 0, 0
     cm = [[0] * num_classes for _ in range(num_classes)] if task_type == "multiclass" else None
@@ -136,7 +140,7 @@ def evaluate(model, dataloader, device, task_type, threshold=0.5, num_classes=No
     return acc, prec, rec, f1
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--weights", required=True)
@@ -145,12 +149,14 @@ def main():
     parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="auto")
     parser.add_argument("--bits", type=str, default="float,8,4,2")
     parser.add_argument("--act-bits", type=str, default=None)
-    parser.add_argument("--scheme", choices=["per_channel", "per_tensor"], default="per_channel")
+    parser.add_argument("--scheme", choices=["per_tensor", "global"], default="per_tensor")
     parser.add_argument("--symmetric", action="store_true")
+    parser.add_argument("--global-percentile", type=float, default=100.0,
+                        help="Percentile for global quantization scale (default: 100, i.e. max).")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
-    device = torch.device(
+    cfg: Dict[str, Any] = load_config(args.config)
+    device: torch.device = torch.device(
         "cuda" if (args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())) else "cpu"
     )
 
@@ -168,28 +174,25 @@ def main():
         pin = bool(cfg.get("train", {}).get("pin_memory", False))
         dl = DataLoader(combo, batch_size=args.batch_size, shuffle=False, num_workers=nw, pin_memory=pin)
 
-    num_classes = get_num_classes(cfg)
-    task_type = cfg["task"]["type"]
+    num_classes: int = get_num_classes(cfg)
+    task_type: str = cfg["task"]["type"]
 
     # Build model using the shared factory, using one (C,T) sample from dl
-    batch = next(iter(dl))
-    x = batch[0]
-    sample_x = x[0] if x.dim() == 3 else x  # (C,T)
-    model = build_model_from_cfg(cfg, sample_x, num_classes)
+    model: torch.nn.Module = build_model_from_cfg(cfg)
     # Load weights using the shared forgiving loader
     model = load_state_dict_forgiving(model, args.weights, device=torch.device("cpu"))
     model = model.to(device).eval()
 
-    per_channel = args.scheme == "per_channel"
-    symmetric = args.symmetric
+    per_channel: bool = args.scheme == "per_channel"
+    symmetric: bool = args.symmetric
 
-    def parse_list(s):
+    def parse_list(s: str) -> List[str]:
         return [t.strip() for t in s.split(",") if t.strip()]
 
-    bits_list = parse_list(args.bits)
-    act_bits_list = bits_list if args.act_bits is None else parse_list(args.act_bits)
+    bits_list: List[str] = parse_list(args.bits)
+    act_bits_list: List[str] = bits_list if args.act_bits is None else parse_list(args.act_bits)
 
-    results = []
+    results: List[Tuple[str, float, float, float, float]] = []
     for i, wb in enumerate(bits_list):
         ab = act_bits_list[i] if i < len(act_bits_list) else act_bits_list[-1]
 
@@ -201,7 +204,8 @@ def main():
             a_bits_i = 32 if is_float_spec(ab) else int(ab)
             tag = "float" if (w_bits_i >= 16 and a_bits_i >= 16) else f"{w_bits_i}w{a_bits_i}a"
             model_q = quantize_model_weights_and_activations(
-                model, w_bits_i, a_bits_i, per_channel=per_channel, symmetric=symmetric
+                model, w_bits_i, a_bits_i, scheme=args.scheme, symmetric=symmetric,
+                global_percentile=args.global_percentile
             )
 
         acc, prec, rec, f1 = evaluate(model_q.to(device), dl, device, task_type, num_classes=num_classes)
@@ -209,15 +213,15 @@ def main():
         print(f"[{tag:>8}] Acc={acc:.4f} P={prec:.4f} R={rec:.4f} F1={f1:.4f}")
 
     # --- plotting unchanged (use results list) ---
-    plots_dir = os.path.join(cfg["output"]["plots_dir"], "eval")
+    plots_dir: str = os.path.join(cfg["output"]["plots_dir"], "eval")
     os.makedirs(plots_dir, exist_ok=True)
-    out_path = os.path.join(plots_dir, "ptq_metrics_vs_bits.png")
+    out_path: str = os.path.join(plots_dir, "ptq_metrics_vs_bits.png")
 
-    labels = []
-    accs = []
-    precs = []
-    recs = []
-    f1s = []
+    labels: List[str] = []
+    accs: List[float] = []
+    precs: List[float] = []
+    recs: List[float] = []
+    f1s: List[float] = []
     for tag, acc, prec, rec, f1 in results:
         labels.append(tag)
         accs.append(acc); precs.append(prec); recs.append(rec); f1s.append(f1)
