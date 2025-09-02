@@ -33,10 +33,9 @@ def extract_intermediate_activations(model: torch.nn.Module, x: torch.Tensor) ->
         for block in tcn:
             out = block(out)
             activations.append(out.detach().cpu())
-        # After all blocks, apply pool, dropout, fc
         pooled = model.pool(out).squeeze(-1)  # (N, hidden)
-        dropped = model.dropout(pooled)
-        logits = model.fc(dropped)
+        # Use model's own forward for logits to ensure correct inference
+        logits = model(x)
     return activations, pooled.detach().cpu(), logits.detach().cpu()
 
 
@@ -68,27 +67,41 @@ def plot_activations_3d(input_mfcc: torch.Tensor, activations: List[torch.Tensor
     # Reshape to (channels, 1) and (classes, 1) for consistent plotting
     pooled_arr = pooled_arr.T  # (hidden_channels, 1)
     logits_arr = logits_arr.T  # (num_classes, 1)
-    arrs.append(pooled_arr)
-    arrs.append(logits_arr)
+    # Normalize pooled to its own max
+    pooled_max = pooled_arr.max() if pooled_arr.max() != 0 else 1.0
+    pooled_arr_norm = pooled_arr / pooled_max
+    # Normalize logits to 1 (softmax not needed for visualization)
+    logits_arr_norm = logits_arr / np.max(np.abs(logits_arr)) if np.max(np.abs(logits_arr)) != 0 else logits_arr
+    arrs.append(pooled_arr_norm)
+    arrs.append(logits_arr_norm)
     #print("Pooled activations (repeated):\n", pooled_arr)
     #print("Logits (repeated):\n", logits_arr)
 
-    # Compute global max for normalization
-    global_max = max(a.max() for a in arrs)
+    # Compute global max for normalization for intermediate activations
+    global_max = max(a.max() for a in arrs[:-2])
     print(len(arrs), "arrays to plot, global max:", global_max)
     norm = colors.Normalize(vmin=0, vmax=global_max)
-    # Plot only up to max_blocks (exclude pooled and FC heatmaps)
-    for z, arr in enumerate(arrs[:]):
+    # Norms for pooled and logits
+    norm_pooled = colors.Normalize(vmin=0, vmax=1)
+    norm_logits = colors.Normalize(vmin=-1, vmax=1)
+
+    # Plot all heatmaps
+    for z, arr in enumerate(arrs):
         print(arr.shape)
-        # For pooled and logits, shape is (1, N), so repeat along time axis (axis=1) if needed
         if arr.shape[1] == 1:
-            time_axis = np.arange(8) * hop_length_s  # 8 time steps for visibility
+            time_axis = np.arange(8) * hop_length_s
             arr = np.repeat(arr, 8, axis=1)
         else:
             time_axis = np.arange(arr.shape[1]) * hop_length_s
         y, x_ = np.meshgrid(np.arange(arr.shape[0]), time_axis, indexing='ij')
         z_arr = np.full_like(x_, z)
-        surf = ax.plot_surface(x_, y, z_arr, facecolors=cmap(norm(arr)), rstride=1, cstride=1, shade=False)
+        # Use separate normalization for pooled and logits
+        if z == len(arrs) - 2:
+            surf = ax.plot_surface(x_, y, z_arr, facecolors=cmap(norm_pooled(arr)), rstride=1, cstride=1, shade=False)
+        elif z == len(arrs) - 1:
+            surf = ax.plot_surface(x_, y, z_arr, facecolors=cmap(norm_logits(arr)), rstride=1, cstride=1, shade=False)
+        else:
+            surf = ax.plot_surface(x_, y, z_arr, facecolors=cmap(norm(arr)), rstride=1, cstride=1, shade=False)
 
     ax.set_xlabel('Time')
     ax.set_ylabel('Channels')
@@ -113,10 +126,21 @@ def plot_activations_3d(input_mfcc: torch.Tensor, activations: List[torch.Tensor
     plt.figtext(0.01, 0.98, f"File: {filename}", fontsize=10, va='top', ha='left', color='navy')
     plt.figtext(0.01, 0.93, f"Detected keyword: {detected_keyword}", fontsize=12, va='top', ha='left', color='darkred')
 
+    # Shared colorbar for intermediate activations
     mappable = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    mappable.set_array(np.concatenate([a.flatten() for a in arrs]))
+    mappable.set_array(np.concatenate([a.flatten() for a in arrs[:-2]]))
     cbar = plt.colorbar(mappable, ax=ax, shrink=0.5, pad=0.1)
-    cbar.set_label('Activation Amplitude')
+    cbar.set_label('Activation Amplitude (Intermediate)')
+    # Separate colorbar for pooled
+    mappable_pooled = plt.cm.ScalarMappable(cmap=cmap, norm=norm_pooled)
+    mappable_pooled.set_array(arrs[-2].flatten())
+    cbar_pooled = plt.colorbar(mappable_pooled, ax=ax, shrink=0.5, pad=0.1)
+    cbar_pooled.set_label('Pooled Activation (Normalized)')
+    # Separate colorbar for logits
+    mappable_logits = plt.cm.ScalarMappable(cmap=cmap, norm=norm_logits)
+    mappable_logits.set_array(arrs[-1].flatten())
+    cbar_logits = plt.colorbar(mappable_logits, ax=ax, shrink=0.5, pad=0.1)
+    cbar_logits.set_label('Logits (Normalized)')
 
     if save_path:
         plt.savefig(save_path)
@@ -167,6 +191,14 @@ if __name__ == "__main__":
     model = build_model_from_cfg(cfg)
     model = load_state_dict_forgiving(model, weights_path, device=torch.device("cpu"))
     model.eval()
+
+    # Print state of dropout and normalization layers
+    print("\nDropout and Normalization Layer States:")
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Dropout):
+            print(f"Dropout: {name}, training={module.training}, p={module.p}")
+        if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.GroupNorm, torch.nn.LayerNorm)):
+            print(f"Norm: {name}, training={module.training}")
 
     # Load preprocessed MFCC numpy file
     mfcc = np.load(mfcc_npy_file)
