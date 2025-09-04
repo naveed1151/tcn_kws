@@ -30,8 +30,11 @@ def animation_in_time(input_mfcc: torch.Tensor, activations: List[torch.Tensor],
     Animates all layer heatmaps at once, revealing one additional time step per frame.
     """
     import matplotlib.animation as animation
-    fig = plt.figure(figsize=(16, 14))
-    ax = fig.add_subplot(111, projection='3d')
+    fig = plt.figure(figsize=(18, 14))
+    gs = fig.add_gridspec(2, 1, height_ratios=[8, 2], hspace=0.35)
+    ax = fig.add_subplot(gs[0], projection='3d')
+    ax_softmax = fig.add_subplot(gs[1])
+    fig.subplots_adjust(hspace=0.35)
     ax.set_position([0.08, 0.18, 0.84, 0.74])
     hop_length_s = float(cfg['data']['mfcc']['hop_length_s']) if 'cfg' in globals() else 0.016
     arrs = []
@@ -41,35 +44,26 @@ def animation_in_time(input_mfcc: torch.Tensor, activations: List[torch.Tensor],
         if arr.dim() == 1:
             arr = arr.unsqueeze(0)
         arrs.append(arr.numpy())
-    pooled_arr = pooled.numpy().T
-    pooled_max = pooled_arr.max() if pooled_arr.max() != 0 else 1.0
-    pooled_arr_norm = pooled_arr / pooled_max
-    arrs.append(pooled_arr_norm)
-    logits_arr = logits.numpy().T
-    logits_arr_norm = logits_arr / np.max(np.abs(logits_arr)) if np.max(np.abs(logits_arr)) != 0 else logits_arr
-    arrs.append(logits_arr_norm)
-    global_max = max(a.max() for a in arrs[:-2])
+    # Only input and intermediate activations (no pooled/fc)
+    global_max = max(a.max() for a in arrs)
     norm = colors.Normalize(vmin=0, vmax=global_max)
-    norm_pooled = colors.Normalize(vmin=0, vmax=1)
-    norm_logits = colors.Normalize(vmin=-1, vmax=1)
     num_blocks = len(activations)
-    z_labels = ["input"] + [f"res_block {i}" for i in range(num_blocks)] + ["pooled", "fc"]
+    z_labels = ["input"] + [f"res_block {i}" for i in range(num_blocks)]
     filename = globals().get('mfcc_npy_file', 'unknown')
-    fc_arr = arrs[-1]
     try:
-        keyword_idx = int(np.argmax(fc_arr))
         class_list = cfg['task']['class_list']
         if cfg['task'].get('include_unknown', False):
             class_list = class_list + ['unknown']
         if cfg['task'].get('include_background', False):
             class_list = class_list + ['background']
-        detected_keyword = class_list[keyword_idx] if keyword_idx < len(class_list) else str(keyword_idx)
     except Exception:
-        detected_keyword = 'N/A'
+        class_list = [str(i) for i in range(11)]
     # Find max time steps
     max_time = max(a.shape[1] for a in arrs if a.ndim > 1)
+    n_classes = len(class_list)
     def animate(t):
         ax.clear()
+        # 3D plot: only input and intermediate activations
         for z, arr in enumerate(arrs):
             arr_plot = arr[:, :min(t+1, arr.shape[1])] if arr.ndim > 1 else arr
             if arr_plot.shape[1] == 1:
@@ -79,12 +73,7 @@ def animation_in_time(input_mfcc: torch.Tensor, activations: List[torch.Tensor],
                 time_axis = np.arange(arr_plot.shape[1]) * hop_length_s
             y, x_ = np.meshgrid(np.arange(arr_plot.shape[0]), time_axis, indexing='ij')
             z_arr = np.full_like(x_, z)
-            if z == len(arrs) - 2:
-                surf = ax.plot_surface(x_, y, z_arr, facecolors=cmap(norm_pooled(arr_plot)), rstride=1, cstride=1, shade=False)
-            elif z == len(arrs) - 1:
-                surf = ax.plot_surface(x_, y, z_arr, facecolors=cmap(norm_logits(arr_plot)), rstride=1, cstride=1, shade=False)
-            else:
-                surf = ax.plot_surface(x_, y, z_arr, facecolors=cmap(norm(arr_plot)), rstride=1, cstride=1, shade=False)
+            surf = ax.plot_surface(x_, y, z_arr, facecolors=cmap(norm(arr_plot)), rstride=1, cstride=1, shade=False)
         ax.set_xlabel('Time', fontsize=28)
         ax.set_ylabel('Channels', fontsize=28)
         ax.set_zlabel('Block', fontsize=28)
@@ -92,11 +81,51 @@ def animation_in_time(input_mfcc: torch.Tensor, activations: List[torch.Tensor],
         ax.set_zticklabels(z_labels, fontsize=24)
         plt.title('TCN Activations: Revealing Time Steps', fontsize=32)
         plt.figtext(0.01, 0.98, f"File: {filename}", fontsize=22, va='top', ha='left', color='navy')
-        plt.figtext(0.01, 0.93, f"Detected keyword: {detected_keyword}", fontsize=26, va='top', ha='left', color='darkred')
+        # Softmax time subplot
+        ax_softmax.clear()
+        ax_softmax.set_title('Softmax Output Over Time', fontsize=28)
+        ax_softmax.set_xlabel('Time', fontsize=22)
+        ax_softmax.set_ylabel('Softmax Value', fontsize=22)
+        ax_softmax.set_ylim(0, 1)
+        ax_softmax.set_xlim(0, max_time)
+        ax_softmax.set_xticks(np.linspace(0, max_time, num=8, dtype=int))
+        ax_softmax.set_yticks(np.linspace(0, 1, num=5))
+        ax_softmax.set_xticklabels([f"{int(x)}" for x in np.linspace(0, max_time, num=8)])
+        ax_softmax.set_yticklabels([f"{y:.2f}" for y in np.linspace(0, 1, num=5)])
+        # Compute per-time-step logits from last block activations using model.fc
+        pooled_over_time = []
+        last_block_acts = arrs[-1]  # shape (hidden, time)
+        for tt in range(t+1):
+            # Get activations up to tt
+            if last_block_acts.ndim == 2 and last_block_acts.shape[1] >= tt+1:
+                acts_t = last_block_acts[:, :tt+1]  # (hidden, tt+1)
+                # Add batch dimension for pooling: (1, hidden, tt+1)
+                acts_t_tensor = torch.tensor(acts_t, dtype=torch.float32).unsqueeze(0)
+                # Apply model.pool (should output (1, hidden, 1) or (1, hidden))
+                pooled_t = model.pool(acts_t_tensor).squeeze(-1)  # (1, hidden)
+                # Apply model.fc
+                logits_t = model.fc(pooled_t)  # (1, n_classes)
+                logits_np = logits_t.detach().cpu().numpy().flatten()  # (n_classes,)
+            else:
+                logits_np = np.zeros(n_classes)
+            # Compute softmax for this time step
+            with np.errstate(over='ignore', invalid='ignore'):
+                exp_logits = np.exp(logits_np)
+                sum_exp = np.sum(exp_logits)
+                softmax_vals = exp_logits / sum_exp if sum_exp != 0 else np.zeros_like(exp_logits)
+            pooled_over_time.append(softmax_vals)
+        # pooled_over_time: list of arrays (n_classes,) for each t
+        if pooled_over_time:
+            softmax_matrix = np.stack(pooled_over_time, axis=1)  # (n_classes, t+1)
+            n_plot = min(n_classes, softmax_matrix.shape[0])
+            for i in range(n_plot):
+                ax_softmax.plot(np.arange(softmax_matrix.shape[1]), softmax_matrix[i], label=class_list[i])
+            ax_softmax.legend(fontsize=14, loc='upper right', ncol=2)
+        plt.figtext(0.01, 0.93, f"Softmax curves for all classes", fontsize=22, va='top', ha='left', color='darkred')
     ani = animation.FuncAnimation(fig, animate, frames=max_time, interval=300, blit=False, repeat=False)
     # Add colorbar (for intermediate activations)
     mappable = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    mappable.set_array(np.concatenate([a.flatten() for a in arrs[:-2]]))
+    mappable.set_array(np.concatenate([a.flatten() for a in arrs]))
     cbar = plt.colorbar(mappable, ax=ax, shrink=0.4, pad=0.1)
     cbar.set_label('Activation Amplitude (Intermediate)', fontsize=24)
     cbar.ax.tick_params(labelsize=20)
