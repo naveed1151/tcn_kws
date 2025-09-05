@@ -6,7 +6,7 @@ import os
 from tqdm import tqdm
 
 
-def extract_mfcc(filepath, sr=16000, n_mfcc=16, frame_length=0.02, hop_length=0.01):
+def extract_mfcc(filepath, sr=16000, n_mfcc=16, frame_length=0.02, hop_length=0.01, center=True):
     """
     Extract MFCC features from an audio file.
     
@@ -26,7 +26,8 @@ def extract_mfcc(filepath, sr=16000, n_mfcc=16, frame_length=0.02, hop_length=0.
         sr=sr,
         n_mfcc=n_mfcc,
         n_fft=int(frame_length * sr),
-        hop_length=int(hop_length * sr)
+        hop_length=int(hop_length * sr),
+        center=center
     )
     return y, mfcc.T
 
